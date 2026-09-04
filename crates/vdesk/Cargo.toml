@@ -1,0 +1,30 @@
+[package]
+name = "vdesk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+image.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+uuid.workspace = true
+vdesk-protocol = { path = "../vdesk-protocol" }
+x11rb.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true

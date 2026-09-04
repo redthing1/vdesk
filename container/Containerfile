@@ -1,0 +1,93 @@
+FROM docker.io/library/rust:1.97-slim-bookworm AS builder
+
+WORKDIR /source
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$(dpkg --print-architecture)" in \
+        amd64) echo x86_64-unknown-linux-musl > /tmp/rust-target ;; \
+        arm64) echo aarch64-unknown-linux-musl > /tmp/rust-target ;; \
+        *) echo "unsupported architecture" >&2; exit 1 ;; \
+       esac \
+    && rustup target add "$(cat /tmp/rust-target)"
+COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY crates ./crates
+RUN cargo build --locked --release --target "$(cat /tmp/rust-target)" --bin vdesk \
+    && install -D "target/$(cat /tmp/rust-target)/release/vdesk" /out/vdesk
+
+FROM docker.io/library/debian:bookworm-slim AS novnc-assets
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl --location --fail --silent --show-error \
+        https://github.com/novnc/noVNC/archive/refs/tags/v1.7.0.tar.gz \
+        --output /tmp/novnc.tar.gz \
+    && echo "b1003a11b6e6e8d8f7f5e5586daae7f8ca651d8aee0aa155ff9ac841c48f52c6  /tmp/novnc.tar.gz" \
+        | sha256sum --check --strict \
+    && mkdir /opt/novnc \
+    && tar --extract --gzip --file /tmp/novnc.tar.gz --strip-components=1 --directory /opt/novnc
+
+FROM docker.io/library/debian:bookworm-slim AS runtime-core
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        at-spi2-core \
+        python3-pyatspi \
+        ca-certificates \
+        dbus-daemon \
+        dbus-x11 \
+        fonts-dejavu-core \
+        fonts-liberation \
+        tini \
+        x11-utils \
+        x11vnc \
+        xclip \
+        xdotool \
+        xfce4-panel \
+        xfce4-session \
+        xfce4-settings \
+        xfconf \
+        xfdesktop4 \
+        xfwm4 \
+        xvfb \
+        xfce4-terminal \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 --shell /bin/bash vdesk \
+    && install -d -o vdesk -g vdesk -m 0700 /run/vdesk /run/vdesk/user \
+    && install -d -o vdesk -g vdesk -m 0755 /workspace /downloads
+
+COPY --from=builder /out/vdesk /usr/local/bin/vdesk
+COPY --from=novnc-assets /opt/novnc /usr/share/novnc
+COPY container/a11y_snapshot.py /usr/local/libexec/vdesk-a11y-snapshot
+
+RUN ln -s /usr/local/bin/vdesk /usr/local/bin/vdesk-chromium \
+    && ln -s /usr/local/bin/vdesk-chromium /usr/local/bin/chromium \
+    && chmod 0755 /usr/local/libexec/vdesk-a11y-snapshot
+
+ENV HOME=/home/vdesk \
+    USER=vdesk \
+    DISPLAY=:99 \
+    VDESK_DISPLAY=:99 \
+    VDESK_NOVNC_DIR=/usr/share/novnc \
+    XDG_RUNTIME_DIR=/run/vdesk/user \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/vdesk/bus \
+    NO_AT_BRIDGE=0
+
+USER vdesk
+WORKDIR /workspace
+EXPOSE 7777
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/vdesk", "serve"]
+
+FROM runtime-core AS minimal
+
+FROM runtime-core AS default
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium mousepad thunar \
+    && rm -rf /var/lib/apt/lists/* \
+    && sed -i 's|Exec=/usr/bin/chromium|Exec=/usr/local/bin/vdesk-chromium|' \
+        /usr/share/applications/chromium.desktop
+USER vdesk
