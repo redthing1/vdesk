@@ -22,7 +22,7 @@ FROM scratch AS artifacts
 
 COPY --from=builder /out /
 
-FROM docker.io/library/debian:bookworm-slim AS runtime-core
+FROM docker.io/library/debian:trixie-slim AS runtime-core
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -34,7 +34,8 @@ RUN apt-get update \
         dbus-x11 \
         fonts-dejavu-core \
         fonts-liberation \
-        x11-utils \
+        libgl1-mesa-dri \
+        tigervnc-standalone-server \
         x11vnc \
         xclip \
         xdotool \
@@ -44,12 +45,12 @@ RUN apt-get update \
         xfconf \
         xfdesktop4 \
         xfwm4 \
-        xvfb \
         xfce4-terminal \
         tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 --shell /bin/bash vdesk \
     && install -d -o vdesk -g vdesk -m 0700 /run/vdesk /run/vdesk/user \
+    && install -d -m 1777 /tmp/.X11-unix \
     && install -d -o vdesk -g vdesk -m 0755 /workspace /downloads \
     && ln -s /usr/local/bin/vdesk /usr/local/bin/vdesk-chromium \
     && ln -s /usr/local/bin/vdesk-chromium /usr/local/bin/chromium

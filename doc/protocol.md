@@ -4,7 +4,7 @@ The CLI is the normal interface. `--json` exposes stable responses for agents
 and scripts, while `vdesk capabilities` reports the operations and limits of the
 running service.
 
-Protocol v1 uses authenticated HTTP with JSON request and response bodies.
+Protocol v2 uses authenticated HTTP with JSON request and response bodies.
 Screenshots are separate lossless PNG resources. Unknown JSON fields, unsupported
 protocol versions, invalid coordinates, oversized payloads, and unbalanced held
 input are rejected before execution.
@@ -43,7 +43,7 @@ For a coherent sequence, pass a batch file:
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "request_id": "save-document-1",
   "expected_input_generation": 12,
   "actions": [
@@ -117,7 +117,7 @@ returns byte count and SHA-256 metadata. Local exports are replaced atomically.
 
 ## Authentication and errors
 
-Every `/v1` endpoint requires the session data token. Viewer WebSocket access
+Every `/v2` endpoint requires the session data token. Viewer WebSocket access
 uses a separate viewer token. Errors use one JSON envelope with a stable code,
 message, and retryability flag. Secrets are excluded from normal status and JSON
 output.
@@ -128,16 +128,18 @@ It does not expose container lifecycle or arbitrary shell execution.
 
 ## Deployment independence
 
-Protocol v1 is identical in managed and embedded deployments. A client
+Protocol v2 is identical in managed and embedded deployments. A client
 descriptor carries only an endpoint, data token, session identity, geometry,
 and runtime generation; it never carries an engine kind, container name,
 machine name, host path, lifecycle credential, or viewer credential.
 
-`files` and `process` in the capabilities response are deployment facts. They
-are `false` when an embedded runtime has no explicit workspace/download roots,
-and those endpoints return `capability_unavailable`. Clients must inspect
-capabilities instead of assuming the managed image's `/workspace` and
-`/downloads` convention.
+`hardware_acceleration`, `files`, and `process` in the capabilities response
+are deployment facts. `hardware_acceleration` means the X server exposes DRI3;
+it does not claim that a particular application used the GPU successfully.
+`files` and `process` are `false` when an embedded runtime has no explicit
+workspace/download roots, and those endpoints return `capability_unavailable`.
+Clients must inspect capabilities instead of assuming the managed image's
+`/workspace` and `/downloads` convention.
 
 The embedded `rfb-stdio` command is a viewer transport, not a data-plane
 endpoint or protocol extension. It validates the local runtime and connects to

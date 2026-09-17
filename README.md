@@ -11,7 +11,7 @@ view. One runtime supports two deliberately small deployment shapes:
 Podman is preferred for managed desktops and Docker has the same public
 behavior. Embedded mode does not need either engine inside the sandbox.
 
-The v1 implementation is tested on amd64 Linux with rootless Podman and Docker.
+Protocol v2 is tested on amd64 Linux with rootless Podman and Docker.
 
 ## Quick start
 
@@ -133,7 +133,7 @@ vdesk image build --profile minimal --tag localhost/vdesk:minimal
 vdesk image build --profile default --tag localhost/vdesk:dev
 ```
 
-The minimal image contains Xvfb, Xfce, x11vnc, AT-SPI, and the vdesk
+The minimal image contains Xvnc, Xfce, x11vnc, AT-SPI, and the vdesk
 service. The default image adds Chromium, Mousepad, and Thunar.
 
 The `artifacts` target contains only the static binary and AT-SPI helper. Copy it
@@ -145,9 +145,30 @@ The desktop runs as a non-root user with dropped capabilities,
 socket. It is a shared-kernel container, not a hostile multi-tenant VM.
 Chromium currently uses `--no-sandbox` inside that container.
 
-The current Xvfb backend is software-rendered. Proper GUI GPU acceleration
-requires a different display backend as well as explicit device delegation;
-passing `/dev/dri` to Xvfb alone is not presented as acceleration.
+## GPU acceleration
+
+On a Linux host with a DRM render node, managed mode has one explicit option:
+
+```sh
+vdesk open --gpu
+```
+
+This delegates one render node and refuses to report the desktop ready unless
+X11 exposes DRI3. It does not grant a KMS/card device, host display, or engine
+socket. The managed path intentionally rejects NVIDIA for now because the
+standard NVIDIA CDI profile grants broader device access than this boundary.
+On an enforcing SELinux host, use its `container_use_devices` policy rather
+than disabling container labels.
+
+The same runtime needs no GPU flag inside an existing sandbox. Let its outer
+owner delegate the device—for example `mim create work --image IMAGE --gpu`—and
+check `vdesk capabilities` inside it. Without a visible render node, vdesk uses
+software rendering normally.
+
+The managed image uses TigerVNC Xvnc; embedded images need Xvnc 1.14 or newer
+for acceleration. The normal suites verify software fallback. The optional GPU
+suite checks delegation and DRI3 readiness, while renderer and application
+acceptance still require a GPU-equipped Linux host.
 
 ## Develop
 
@@ -160,6 +181,10 @@ VDESK_AGENT_TESTS=1 tests/e2e.sh podman
 VDESK_AGENT_TESTS=1 tests/e2e.sh docker
 tests/embedded-e2e.sh podman
 tests/embedded-e2e.sh docker
+
+# On a suitable GPU host:
+VDESK_GPU_TESTS=1 tests/e2e.sh podman
+VDESK_GPU_TESTS=1 tests/e2e.sh docker
 ```
 
 The E2E suite additionally needs `curl`, `jq`, and Bun. See

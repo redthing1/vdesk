@@ -27,15 +27,16 @@ Copy it into the existing image without changing that image's lifecycle:
 FROM localhost/vdesk:artifacts AS vdesk
 FROM your-existing-image
 
-# Install this distribution's Xvfb, Xfce, x11vnc, xdotool, xclip, D-Bus,
-# AT-SPI/Python bindings, and basic fonts here.
+# Install this distribution's Xvnc (or Xvfb), Xfce, x11vnc, xdotool, xclip,
+# D-Bus, AT-SPI/Python bindings, and basic fonts here.
 COPY --from=vdesk / /
 ```
 
-Only package names are distribution-specific. The runtime requires the
-executables `Xvfb`, `xfce4-session`, `x11vnc`, `xdotool`, `xclip`, and
-`dbus-daemon`; the managed Containerfile is a tested Debian example. Fedora's
-equivalents work with the same artifacts and runtime command.
+Only package names are distribution-specific. The runtime requires `Xvnc` or
+`Xvfb` plus `xfce4-session`, `x11vnc`, `xdotool`, `xclip`, and `dbus-daemon`;
+the managed Containerfile is one tested example. Xvnc 1.14 or newer is required
+for DRI3 acceleration. The artifacts and runtime command are otherwise
+distribution-neutral.
 
 ## Start and use
 
@@ -66,6 +67,23 @@ exec vdesk serve --local
 That hook is optional. It uses mim's ordinary lifecycle contract; vdesk has no
 mim dependency and can also be started by `mim exec`, another init system, or
 the image entrypoint.
+
+## GPU access
+
+The outer sandbox owns GPU policy. Delegate a render device there and start the
+same runtime normally:
+
+```sh
+mim create work --image IMAGE --gpu
+mim exec work -- vdesk capabilities
+```
+
+Vdesk uses a visible render node automatically and reports
+`hardware_acceleration: true` when X11 exposes DRI3. No visible render node
+means ordinary software rendering. The image must supply the matching Mesa or
+NVIDIA userspace driver. An outer owner may use NVIDIA CDI if its broader device
+scope is acceptable; vdesk neither requests nor interprets that policy. It does
+not add a second container.
 
 File and managed-process APIs are disabled unless both roots are explicit:
 

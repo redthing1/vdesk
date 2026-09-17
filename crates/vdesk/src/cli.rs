@@ -147,18 +147,28 @@ impl From<EngineArg> for EngineKind {
 
 #[derive(Debug, Args)]
 pub struct OpenArgs {
+    /// Container engine to use (Podman is preferred when omitted).
     #[arg(long, value_enum)]
     pub engine: Option<EngineArg>,
+    /// Desktop image to create the session from.
     #[arg(long, default_value = "localhost/vdesk:dev", env = "VDESK_IMAGE")]
     pub image: String,
+    /// Desktop framebuffer size as WIDTHxHEIGHT.
     #[arg(long, default_value = "1280x800", value_parser = parse_size)]
     pub size: (u32, u32),
+    /// Delegate one non-NVIDIA host render node and require DRI3.
+    #[arg(long)]
+    pub gpu: bool,
+    /// Host directory to mount at /workspace (defaults to the current directory).
     #[arg(long)]
     pub workspace: Option<PathBuf>,
+    /// Create the desktop without a host workspace mount.
     #[arg(long, conflicts_with = "workspace")]
     pub no_workspace: bool,
+    /// Explicitly allow ordinary outbound network access (the default).
     #[arg(long, conflicts_with = "offline")]
     pub online: bool,
+    /// Create an internal session network without external connectivity.
     #[arg(long, conflicts_with = "online")]
     pub offline: bool,
 }
@@ -508,14 +518,19 @@ async fn open(name: &str, args: OpenArgs, json_output: bool) -> Result<()> {
     validate_session_name(name)?;
     let store = StateStore::discover()?;
     store.ensure()?;
-    if let Ok(mut descriptor) = store.load(name) {
+    if let Some(mut descriptor) = store.load_optional(name)? {
+        if args.gpu && !descriptor.gpu {
+            bail!(
+                "vdesk '{name}' was created without GPU access; delete it and run `vdesk --session {name} open --gpu`"
+            );
+        }
         let engine = Engine::discover(Some(descriptor.engine))?;
-        let inspection = engine.inspect(&descriptor.container_name).await?;
+        let inspection = engine.inspect_session(&descriptor).await?;
         if inspection.exists {
             if !inspection.running {
-                engine.start(&descriptor.container_name).await?;
+                engine.start(&descriptor).await?;
             }
-            let inspection = wait_for_endpoint(&engine, &descriptor.container_name).await?;
+            let inspection = wait_for_endpoint(&engine, &descriptor).await?;
             descriptor.host_endpoint = usable_host_endpoint(&inspection, descriptor.offline)?;
             if let Some(address) = inspection.container_ip.clone() {
                 descriptor.container_endpoint = format!("http://{address}:7777");
@@ -525,9 +540,16 @@ async fn open(name: &str, args: OpenArgs, json_output: bool) -> Result<()> {
             print_open(&descriptor, "ready", json_output)?;
             return Ok(());
         }
-        let _ = engine.remove_network(&descriptor.network_name).await;
-        store.remove(name)?;
+        descriptor.rotate_runtime()?;
         store.remove_client_descriptor(name)?;
+        store.save(&descriptor)?;
+        if let Err(error) = launch_container(&store, &engine, &mut descriptor).await {
+            let logs = engine.logs(&descriptor.container_name, 80).await.unwrap_or_default();
+            let _ = engine.remove_container(&descriptor, true).await;
+            bail!("desktop recovery failed: {error:#}\n{}", tail_for_error(&logs));
+        }
+        print_open(&descriptor, "recreated", json_output)?;
+        return Ok(());
     }
 
     let engine = Engine::discover(args.engine.map(Into::into))?;
@@ -550,32 +572,37 @@ async fn open(name: &str, args: OpenArgs, json_output: bool) -> Result<()> {
         now_ms(),
     )?;
     descriptor.workspace = workspace;
+    descriptor.gpu = args.gpu;
     descriptor.offline = args.offline;
     descriptor.container_endpoint = format!("http://{}:7777", descriptor.container_name);
     store.save(&descriptor)?;
 
-    let create_result = async {
-        engine.create_network(&descriptor).await?;
-        engine.create_container(&descriptor).await?;
-        let inspection = wait_for_endpoint(&engine, &descriptor.container_name).await?;
-        descriptor.host_endpoint = usable_host_endpoint(&inspection, descriptor.offline)?;
-        descriptor.container_endpoint = format!(
-            "http://{}:7777",
-            inspection.container_ip.context("desktop does not have a private network address")?
-        );
-        store.save(&descriptor)?;
-        wait_for_service(&descriptor, &engine).await
-    }
-    .await;
+    let create_result = launch_container(&store, &engine, &mut descriptor).await;
 
     if let Err(error) = create_result {
         let logs = engine.logs(&descriptor.container_name, 80).await.unwrap_or_default();
-        let _ = engine.remove_container(&descriptor.container_name, true).await;
-        let _ = engine.remove_network(&descriptor.network_name).await;
+        let _ = engine.remove_container(&descriptor, true).await;
+        let _ = engine.remove_network(&descriptor).await;
         let _ = store.remove(name);
         bail!("desktop failed to become ready: {error:#}\n{}", tail_for_error(&logs));
     }
     print_open(&descriptor, "created", json_output)
+}
+
+async fn launch_container(
+    store: &StateStore,
+    engine: &Engine,
+    descriptor: &mut SessionDescriptor,
+) -> Result<()> {
+    engine.create_container(descriptor).await?;
+    let inspection = wait_for_endpoint(engine, descriptor).await?;
+    descriptor.host_endpoint = usable_host_endpoint(&inspection, descriptor.offline)?;
+    descriptor.container_endpoint = format!(
+        "http://{}:7777",
+        inspection.container_ip.context("desktop does not have a private network address")?
+    );
+    store.save(descriptor)?;
+    wait_for_service(descriptor, engine).await
 }
 
 fn workspace_from_args(args: &OpenArgs) -> Result<Option<PathBuf>> {
@@ -594,10 +621,13 @@ fn workspace_from_args(args: &OpenArgs) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-async fn wait_for_endpoint(engine: &Engine, container: &str) -> Result<ContainerInspection> {
+async fn wait_for_endpoint(
+    engine: &Engine,
+    descriptor: &SessionDescriptor,
+) -> Result<ContainerInspection> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let inspection = engine.inspect(container).await?;
+        let inspection = engine.inspect_session(descriptor).await?;
         if !inspection.exists {
             bail!("desktop container disappeared during startup");
         }
@@ -638,11 +668,19 @@ async fn wait_for_service(descriptor: &SessionDescriptor, engine: &Engine) -> Re
                     && health.session_id == descriptor.session_id.to_string()
                     && health.runtime_generation == descriptor.runtime_generation =>
             {
+                if descriptor.gpu {
+                    let capabilities = client.capabilities().await?;
+                    if !capabilities.hardware_acceleration {
+                        bail!(
+                            "GPU access was requested but the desktop did not expose hardware acceleration"
+                        );
+                    }
+                }
                 return Ok(());
             }
             _ => {}
         }
-        let inspection = engine.inspect(&descriptor.container_name).await?;
+        let inspection = engine.inspect_session(descriptor).await?;
         if !inspection.running {
             bail!("desktop container exited before its service became ready");
         }
@@ -673,9 +711,13 @@ async fn status(name: &str, json_output: bool) -> Result<()> {
     let store = StateStore::discover()?;
     let descriptor = store.load(name)?;
     let engine = Engine::discover(Some(descriptor.engine))?;
-    let container = engine.inspect(&descriptor.container_name).await?;
+    let container = engine.inspect_session(&descriptor).await?;
     let service_ready = if container.running {
-        DesktopClient::for_host(&descriptor)?.health().await.is_ok()
+        DesktopClient::for_host(&descriptor)?.health().await.is_ok_and(|health| {
+            health.ready
+                && health.session_id == descriptor.session_id.to_string()
+                && health.runtime_generation == descriptor.runtime_generation
+        })
     } else {
         false
     };
@@ -701,7 +743,7 @@ async fn sessions(json_output: bool) -> Result<()> {
     for name in store.list()? {
         let descriptor = store.load(&name)?;
         let engine = Engine::discover(Some(descriptor.engine))?;
-        let container = engine.inspect(&descriptor.container_name).await?;
+        let container = engine.inspect_session(&descriptor).await?;
         reports.push(json!({ "session": descriptor.public(), "container": container }));
     }
     if json_output {
@@ -1104,7 +1146,7 @@ async fn stop(name: &str, json_output: bool) -> Result<()> {
     let store = StateStore::discover()?;
     let descriptor = store.load(name)?;
     let engine = Engine::discover(Some(descriptor.engine))?;
-    engine.stop(&descriptor.container_name).await?;
+    engine.stop(&descriptor).await?;
     if json_output {
         print_json(&json!({ "session": name, "state": "stopped" }))
     } else {
@@ -1117,25 +1159,14 @@ async fn reset(name: &str, json_output: bool) -> Result<()> {
     let store = StateStore::discover()?;
     let mut descriptor = store.load(name)?;
     let engine = Engine::discover(Some(descriptor.engine))?;
-    engine.remove_container(&descriptor.container_name, true).await?;
+    engine.remove_container(&descriptor, true).await?;
     descriptor.rotate_runtime()?;
     store.remove_client_descriptor(name)?;
     store.save(&descriptor)?;
-    let reset_result = async {
-        engine.create_container(&descriptor).await?;
-        let inspection = wait_for_endpoint(&engine, &descriptor.container_name).await?;
-        descriptor.host_endpoint = usable_host_endpoint(&inspection, descriptor.offline)?;
-        descriptor.container_endpoint = format!(
-            "http://{}:7777",
-            inspection.container_ip.context("desktop does not have a private network address")?
-        );
-        store.save(&descriptor)?;
-        wait_for_service(&descriptor, &engine).await
-    }
-    .await;
+    let reset_result = launch_container(&store, &engine, &mut descriptor).await;
     if let Err(error) = reset_result {
         let logs = engine.logs(&descriptor.container_name, 80).await.unwrap_or_default();
-        let _ = engine.remove_container(&descriptor.container_name, true).await;
+        let _ = engine.remove_container(&descriptor, true).await;
         bail!("desktop reset failed: {error:#}\n{}", tail_for_error(&logs));
     }
     if json_output {
@@ -1154,8 +1185,8 @@ async fn delete(name: &str, json_output: bool) -> Result<()> {
     let store = StateStore::discover()?;
     let descriptor = store.load(name)?;
     let engine = Engine::discover(Some(descriptor.engine))?;
-    engine.remove_container(&descriptor.container_name, true).await?;
-    engine.remove_network(&descriptor.network_name).await?;
+    engine.remove_container(&descriptor, true).await?;
+    engine.remove_network(&descriptor).await?;
     store.remove_client_descriptor(name)?;
     store.remove(name)?;
     if json_output {
@@ -1170,7 +1201,7 @@ async fn run_agent(name: &str, args: RunArgs) -> Result<()> {
     let store = StateStore::discover()?;
     let descriptor = store.load(name)?;
     let engine = Engine::discover(Some(descriptor.engine))?;
-    let inspection = engine.inspect(&descriptor.container_name).await?;
+    let inspection = engine.inspect_session(&descriptor).await?;
     if !inspection.running {
         bail!("vdesk '{name}' is not running; run `vdesk --session {name} open` first");
     }
@@ -1357,10 +1388,14 @@ fn command_status(command: &str) -> CommandStatus {
 }
 
 fn find_in_path(command: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let search = std::env::var_os("PATH")?;
-    std::env::split_paths(&search)
-        .map(|directory| directory.join(command))
-        .find(|candidate| candidate.is_file())
+    std::env::split_paths(&search).map(|directory| directory.join(command)).find(|candidate| {
+        candidate
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    })
 }
 
 fn parse_size(value: &str) -> Result<(u32, u32), String> {
@@ -1408,6 +1443,15 @@ mod tests {
         assert!(Cli::try_parse_from(["vdesk", "open", "--size", "1280x800"]).is_ok());
         assert!(Cli::try_parse_from(["vdesk", "open", "--size", "1280X800"]).is_err());
         assert!(Cli::try_parse_from(["vdesk", "open", "--size", "0x800"]).is_err());
+    }
+
+    #[test]
+    fn gpu_is_an_explicit_open_option() {
+        let cli = Cli::try_parse_from(["vdesk", "open", "--gpu"]).unwrap();
+        let Commands::Open(open) = cli.command else {
+            panic!("wrong command");
+        };
+        assert!(open.gpu);
     }
 
     #[test]

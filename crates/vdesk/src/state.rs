@@ -91,6 +91,8 @@ pub struct SessionDescriptor {
     pub viewer_token: Secret,
     pub geometry: Geometry,
     pub runtime_generation: u64,
+    #[serde(default)]
+    pub gpu: bool,
     pub offline: bool,
     pub workspace: Option<PathBuf>,
     pub created_at_ms: u64,
@@ -125,6 +127,7 @@ impl SessionDescriptor {
             viewer_token: Secret::generate()?,
             geometry,
             runtime_generation: 1,
+            gpu: false,
             offline: false,
             workspace: None,
             created_at_ms,
@@ -143,6 +146,7 @@ impl SessionDescriptor {
             host_endpoint: &self.host_endpoint,
             geometry: self.geometry,
             runtime_generation: self.runtime_generation,
+            gpu: self.gpu,
             offline: self.offline,
             workspace: self.workspace.as_deref(),
             created_at_ms: self.created_at_ms,
@@ -162,6 +166,7 @@ pub struct PublicSessionDescriptor<'a> {
     pub host_endpoint: &'a str,
     pub geometry: Geometry,
     pub runtime_generation: u64,
+    pub gpu: bool,
     pub offline: bool,
     pub workspace: Option<&'a Path>,
     pub created_at_ms: u64,
@@ -353,11 +358,23 @@ impl StateStore {
     }
 
     pub fn load(&self, name: &str) -> Result<SessionDescriptor> {
+        self.load_optional(name)?.with_context(|| format!("vdesk session '{name}' does not exist"))
+    }
+
+    pub fn load_optional(&self, name: &str) -> Result<Option<SessionDescriptor>> {
         validate_session_name(name)?;
         let target = self.root.join("sessions").join(format!("{name}.json"));
-        refuse_symlink(&target)?;
-        let metadata = fs::metadata(&target)
-            .with_context(|| format!("read metadata for {}", target.display()))?;
+        let metadata = match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("refusing symbolic link at {}", target.display())
+            }
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read metadata for {}", target.display()));
+            }
+        };
         if !metadata.is_file() || metadata.len() > MAX_DESCRIPTOR_BYTES {
             bail!("session descriptor is not a bounded regular file");
         }
@@ -375,7 +392,7 @@ impl StateStore {
         if descriptor.name != name {
             bail!("session descriptor name does not match its filename");
         }
-        Ok(descriptor)
+        Ok(Some(descriptor))
     }
 
     pub fn list(&self) -> Result<Vec<String>> {
@@ -621,6 +638,26 @@ mod tests {
 
         store.remove("work").unwrap();
         assert!(store.list().unwrap().is_empty());
+        assert!(store.load_optional("work").unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_descriptors_are_not_treated_as_absent() {
+        let temporary = tempdir().unwrap();
+        let store = StateStore::new(temporary.path().join("state")).unwrap();
+        store.ensure().unwrap();
+        fs::create_dir_all(store.root().join("sessions")).unwrap();
+        fs::write(store.root().join("sessions/work.json"), "not JSON").unwrap();
+        assert!(store.load_optional("work").is_err());
+    }
+
+    #[test]
+    fn descriptors_without_gpu_state_remain_software_sessions() {
+        let descriptor = descriptor();
+        let mut json = serde_json::to_value(descriptor).unwrap();
+        json.as_object_mut().unwrap().remove("gpu");
+        let loaded: SessionDescriptor = serde_json::from_value(json).unwrap();
+        assert!(!loaded.gpu);
     }
 
     #[test]
@@ -682,6 +719,7 @@ mod tests {
     #[test]
     fn rotating_a_runtime_preserves_identity_and_rotates_authority() {
         let mut session = descriptor();
+        session.gpu = true;
         let session_id = session.session_id;
         let data_token = session.data_token.clone();
         let viewer_token = session.viewer_token.clone();
@@ -691,6 +729,7 @@ mod tests {
         assert_eq!(session.session_id, session_id);
         assert_eq!(session.runtime_generation, 2);
         assert_eq!(session.host_endpoint, "pending");
+        assert!(session.gpu);
         assert_ne!(session.data_token, data_token);
         assert_ne!(session.viewer_token, viewer_token);
     }

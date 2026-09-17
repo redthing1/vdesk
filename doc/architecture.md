@@ -32,11 +32,12 @@ compatibility boundary.
 
 ## Desktop runtime
 
-`vdesk serve` starts Xvfb at fixed geometry, D-Bus, Xfce, the desktop service,
-and a loopback-only x11vnc process. It stays in the foreground, owns and reaps
-its children, and shuts them down on TERM or INT. Screenshots are captured
-directly from X11 as lossless PNGs; agent coordinates never depend on the
-resized or compressed browser view. Input is injected through XTest.
+`vdesk serve` starts an X11 server at fixed geometry, D-Bus, Xfce, the desktop
+service, and a loopback-only x11vnc process. It prefers Xvnc and falls back to
+Xvfb when Xvnc is absent. It stays in the foreground, owns and reaps its
+children, and shuts them down on TERM or INT. Screenshots are captured directly
+from X11 as lossless PNGs; agent coordinates never depend on the resized or
+compressed browser view. Input is injected through XTest.
 
 The managed `minimal` image contains the runtime. `default` adds Chromium,
 Mousepad, and Thunar. The distribution-neutral `artifacts` stage contains only
@@ -51,21 +52,35 @@ that descriptor. The optional workspace and download roots are absent unless
 the caller explicitly supplies both, so capabilities reflect the real sandbox
 rather than inventing path conventions.
 
-Xvfb is a deterministic software-rendered baseline. A future accelerated mode
-must use a display server/compositor that exposes direct rendering and receive
-an explicitly delegated render device from the outer owner. Device passthrough
-alone does not accelerate Xvfb and is therefore not a hidden runtime toggle.
+Xvnc 1.14 or newer can expose DRI3 through a delegated DRM render node. The
+managed `open --gpu` path delegates one render node and requires DRI3 before it
+reports readiness. Embedded mode simply consumes devices visible in its outer
+sandbox; the runtime contains no Podman, Docker, or mim logic. Xvfb and Xvnc
+without a render node remain the software baseline.
+
+Managed mode rejects NVIDIA because its standard CDI profile injects devices
+beyond the render-node-only boundary. Embedded mode does not reinterpret the
+outer sandbox's device policy, so an owner may choose NVIDIA CDI there without
+adding provider logic to vdesk.
+
+Only the outer lifecycle owner handles devices. Vdesk never asks for the host
+display, a KMS/card node, or an engine socket. x11vnc remains the viewer adapter
+because its input hook is the small, proven way to count human input; Xvnc's
+otherwise unused native RFB listener is confined to a private Unix socket.
 
 ## Sessions
 
-Sessions are named containers discovered through labels, so there is no host
-daemon or registry service.
+Private local descriptors index known sessions. Their containers and networks
+carry matching ownership labels that are verified before reuse or removal, so
+there is no host daemon or registry service and corrupt state cannot authorize
+deleting an unrelated resource.
 
 | Operation | Result |
 | --- | --- |
 | `open` | Reuse a healthy session or create one and wait until ready. |
 | `stop` | Stop the container while preserving its writable state. |
 | `open` after `stop` | Resume the same container. |
+| `open` after external removal | Recreate from the descriptor and rotate credentials. |
 | `reset` | Replace the container and rotate its credentials. |
 | `delete` | Remove the container, network, and local descriptor. |
 

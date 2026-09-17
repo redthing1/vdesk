@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 use vdesk_protocol::{
-    AccessibilitySnapshot, Action, ActionBatchRequest, ActionBatchResult, CaptureRequest,
-    ClipboardContent, FileMetadata, FileScope, LaunchRequest, LaunchResult, Observation,
-    ObserveMode, PROTOCOL_VERSION, ProcessInfo, ProcessOutput, ProcessSpawnRequest,
+    AccessibilitySnapshot, Action, ActionBatchRequest, ActionBatchResult, CapabilityReport,
+    CaptureRequest, ClipboardContent, FileMetadata, FileScope, LaunchRequest, LaunchResult,
+    Observation, ObserveMode, PROTOCOL_VERSION, ProcessInfo, ProcessOutput, ProcessSpawnRequest,
     WindowFocusRequest, WindowList,
 };
 
@@ -59,38 +59,38 @@ impl DesktopClient {
     }
 
     pub async fn health(&self) -> Result<Health> {
-        self.json(Method::GET, "/v1/health", Option::<&()>::None).await
+        self.json(Method::GET, "/v2/health", Option::<&()>::None).await
     }
 
-    pub async fn capabilities(&self) -> Result<Value> {
-        self.json(Method::GET, "/v1/capabilities", Option::<&()>::None).await
+    pub async fn capabilities(&self) -> Result<CapabilityReport> {
+        self.json(Method::GET, "/v2/capabilities", Option::<&()>::None).await
     }
 
     pub async fn accessibility(&self) -> Result<AccessibilitySnapshot> {
-        self.json(Method::GET, "/v1/accessibility", Option::<&()>::None).await
+        self.json(Method::GET, "/v2/accessibility", Option::<&()>::None).await
     }
 
     pub async fn windows(&self) -> Result<WindowList> {
-        self.json(Method::GET, "/v1/windows", Option::<&()>::None).await
+        self.json(Method::GET, "/v2/windows", Option::<&()>::None).await
     }
 
     pub async fn focus_window(&self, window_id: String) -> Result<WindowList> {
         self.json(
             Method::POST,
-            "/v1/windows/focus",
+            "/v2/windows/focus",
             Some(&WindowFocusRequest { protocol: PROTOCOL_VERSION, window_id }),
         )
         .await
     }
 
     pub async fn read_clipboard(&self) -> Result<ClipboardContent> {
-        self.json(Method::GET, "/v1/clipboard", Option::<&()>::None).await
+        self.json(Method::GET, "/v2/clipboard", Option::<&()>::None).await
     }
 
     pub async fn write_clipboard(&self, text: String) -> Result<ClipboardContent> {
         self.json(
             Method::PUT,
-            "/v1/clipboard",
+            "/v2/clipboard",
             Some(&ClipboardContent { protocol: PROTOCOL_VERSION, text }),
         )
         .await
@@ -99,7 +99,7 @@ impl DesktopClient {
     pub async fn launch(&self, argv: Vec<String>) -> Result<LaunchResult> {
         self.json(
             Method::POST,
-            "/v1/launch",
+            "/v2/launch",
             Some(&LaunchRequest { protocol: PROTOCOL_VERSION, argv }),
         )
         .await
@@ -112,7 +112,7 @@ impl DesktopClient {
     ) -> Result<ProcessInfo> {
         self.json(
             Method::POST,
-            "/v1/processes",
+            "/v2/processes",
             Some(&ProcessSpawnRequest { protocol: PROTOCOL_VERSION, argv, cwd }),
         )
         .await
@@ -121,7 +121,7 @@ impl DesktopClient {
     pub async fn process_status(&self, process_id: &str) -> Result<ProcessInfo> {
         self.json(
             Method::GET,
-            &format!("/v1/processes/{}", encode_id(process_id)?),
+            &format!("/v2/processes/{}", encode_id(process_id)?),
             Option::<&()>::None,
         )
         .await
@@ -130,7 +130,7 @@ impl DesktopClient {
     pub async fn process_output(&self, process_id: &str) -> Result<ProcessOutput> {
         self.json(
             Method::GET,
-            &format!("/v1/processes/{}/output", encode_id(process_id)?),
+            &format!("/v2/processes/{}/output", encode_id(process_id)?),
             Option::<&()>::None,
         )
         .await
@@ -139,7 +139,7 @@ impl DesktopClient {
     pub async fn kill_process(&self, process_id: &str) -> Result<ProcessInfo> {
         self.json(
             Method::DELETE,
-            &format!("/v1/processes/{}", encode_id(process_id)?),
+            &format!("/v2/processes/{}", encode_id(process_id)?),
             Option::<&()>::None,
         )
         .await
@@ -188,7 +188,7 @@ impl DesktopClient {
     pub async fn observe(&self, include_cursor: bool) -> Result<Observation> {
         self.json(
             Method::POST,
-            "/v1/observations",
+            "/v2/observations",
             Some(&CaptureRequest { protocol: PROTOCOL_VERSION, region: None, include_cursor }),
         )
         .await
@@ -212,12 +212,12 @@ impl DesktopClient {
     }
 
     pub async fn action_batch(&self, request: &ActionBatchRequest) -> Result<ActionBatchResult> {
-        self.json(Method::POST, "/v1/actions", Some(request)).await
+        self.json(Method::POST, "/v2/actions", Some(request)).await
     }
 
     pub async fn image(&self, observation: &Observation) -> Result<Vec<u8>> {
         let href = &observation.image.href;
-        if !href.starts_with("/v1/images/") || href.contains('?') || href.contains('#') {
+        if !href.starts_with("/v2/images/") || href.contains('?') || href.contains('#') {
             bail!("service returned an invalid image resource path");
         }
         let response = self
@@ -247,7 +247,7 @@ impl DesktopClient {
             FileScope::Workspace => "workspace",
             FileScope::Downloads => "downloads",
         };
-        Ok(format!("{}/v1/files/{scope}/{}", self.endpoint, encode_relative_path(path)?))
+        Ok(format!("{}/v2/files/{scope}/{}", self.endpoint, encode_relative_path(path)?))
     }
 
     async fn json<T, B>(&self, method: Method, path: &str, body: Option<&B>) -> Result<T>

@@ -39,8 +39,10 @@ for example `vdesk view -- mim exec -i work -- vdesk rfb-stdio`.
 From a sibling agent container, use the mounted client and descriptor. Inside
 an embedded sandbox, run the same CLI normally; it discovers the local runtime.
 Check `capabilities` before using files or managed processes because embedded
-runtimes expose them only when scoped roots were configured. Do not seek an
-engine socket, raw VNC, host display, or a new shared host path.
+runtimes expose them only when scoped roots were configured. If the task needs
+GPU rendering, require `hardware_acceleration: true`; device visibility alone
+is not proof. Do not seek an engine socket, raw VNC, host display, or a new
+shared host path.
 
 Action delivery is not task success. Verify the resulting pixels, structured
 state, process result, or exported file.

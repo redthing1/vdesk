@@ -9,6 +9,12 @@ temporary=$(mktemp -d "/tmp/vdesk-e2e-${engine}.XXXXXX")
 state="$temporary/state"
 workspace="$temporary/workspace"
 mkdir -m 700 "$state" "$workspace"
+gpu_arg=
+hardware_acceleration=false
+if test "${VDESK_GPU_TESTS:-0}" = 1; then
+    gpu_arg=--gpu
+    hardware_acceleration=true
+fi
 
 cleanup() {
     if test "${VDESK_KEEP:-0}" = 1; then
@@ -23,18 +29,22 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 VDESK_STATE_DIR="$state" "$binary" --session "$session" open \
-    --engine "$engine" --image "$image" --workspace "$workspace" --size 1024x768
+    --engine "$engine" --image "$image" --workspace "$workspace" --size 1024x768 $gpu_arg
 printf 'checking protocol and framebuffer\n'
 
 descriptor="$state/sessions/$session.json"
 endpoint=$(jq -r .host_endpoint "$descriptor")
 viewer_token=$(jq -r .viewer_token "$descriptor")
 container=$(jq -r .container_name "$descriptor")
+network=$(jq -r .network_name "$descriptor")
+session_id=$(jq -r .session_id "$descriptor")
 
-test "$(curl --silent --output /dev/null --write-out '%{http_code}' "$endpoint/v1/health")" = 401
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' "$endpoint/v2/health")" = 401
 
 VDESK_STATE_DIR="$state" "$binary" --json --session "$session" capabilities \
-    | jq -e '.protocol == 1 and .geometry == {"width":1024,"height":768,"dpi":96,"scale":1}' >/dev/null
+    | jq -e --argjson accelerated "$hardware_acceleration" \
+        '.protocol == 2 and .hardware_acceleration == $accelerated and
+         .geometry == {"width":1024,"height":768,"dpi":96,"scale":1}' >/dev/null
 VDESK_STATE_DIR="$state" "$binary" --session "$session" see --output "$temporary/before.png"
 VDESK_STATE_DIR="$state" "$binary" --session "$session" click 20 20
 VDESK_STATE_DIR="$state" "$binary" --session "$session" see --output "$temporary/after.png"
@@ -57,7 +67,7 @@ if command -v bun >/dev/null 2>&1; then
     test "$human_generation" -gt "$idle_generation"
 
     jq -n --argjson generation "$human_generation" --arg request "e2e-interference-$$" \
-        '{protocol:1, request_id:$request, expected_input_generation:$generation,
+        '{protocol:2, request_id:$request, expected_input_generation:$generation,
           actions:[{type:"wait",duration_ms:500},{type:"click",x:300,y:300}], observe:"none"}' \
         > "$temporary/interference.json"
     VDESK_STATE_DIR="$state" "$binary" --json --session "$session" \
@@ -81,7 +91,7 @@ VDESK_STATE_DIR="$state" "$binary" --session "$session" drag 400 400 450 450 --d
 VDESK_STATE_DIR="$state" "$binary" --session "$session" scroll 1 1
 VDESK_STATE_DIR="$state" "$binary" --session "$session" key ESC
 jq -n --arg request "e2e-input-families-$$" \
-    '{protocol:1, request_id:$request,
+    '{protocol:2, request_id:$request,
       actions:[
         {type:"move",x:500,y:500,duration_ms:10},
         {type:"mouse_down",button:"middle"},
@@ -145,6 +155,12 @@ printf 'checking container boundary\n'
     '.[0].Config.User == "vdesk" and (.[0].HostConfig.Privileged | not) and
      (.[0].HostConfig.PortBindings | keys == ["7777/tcp"]) and
      (.[0].HostConfig.SecurityOpt | any(contains("no-new-privileges")))' >/dev/null
+"$engine" inspect "$container" | jq -e --arg session "$session_id" \
+    '.[0].Config.Labels["io.vdesk.managed"] == "true" and
+     .[0].Config.Labels["io.vdesk.session"] == $session' >/dev/null
+"$engine" network inspect "$network" | jq -e --arg session "$session_id" \
+    '.[0] | ((.labels // .Labels)["io.vdesk.managed"] == "true") and
+     ((.labels // .Labels)["io.vdesk.session"] == $session)' >/dev/null
 
 if test "${VDESK_AGENT_TESTS:-0}" = 1; then
     printf 'checking Debian and Alpine agent siblings\n'
@@ -161,6 +177,13 @@ VDESK_STATE_DIR="$state" "$binary" --session "$session" stop
 VDESK_STATE_DIR="$state" "$binary" --session "$session" open
 VDESK_STATE_DIR="$state" "$binary" --json --session "$session" status \
     | jq -e '.container.running and .service_ready' >/dev/null
+
+printf 'checking recovery after external container removal\n'
+recovery_generation=$(jq -r .runtime_generation "$descriptor")
+"$engine" rm -f "$container" >/dev/null
+VDESK_STATE_DIR="$state" "$binary" --session "$session" open
+test "$(jq -r .runtime_generation "$descriptor")" -eq $((recovery_generation + 1))
+
 VDESK_STATE_DIR="$state" "$binary" --session "$session" import README.md downloads/ephemeral.md
 old_data_token=$(jq -r .data_token "$descriptor")
 old_generation=$(jq -r .runtime_generation "$descriptor")
@@ -171,7 +194,7 @@ new_generation=$(jq -r .runtime_generation "$descriptor")
 test "$old_data_token" != "$new_data_token"
 test "$new_generation" -eq $((old_generation + 1))
 test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    -H "Authorization: Bearer $old_data_token" "$new_endpoint/v1/health")" = 401
+    -H "Authorization: Bearer $old_data_token" "$new_endpoint/v2/health")" = 401
 if VDESK_STATE_DIR="$state" "$binary" --session "$session" \
     export downloads/ephemeral.md "$temporary/should-not-exist" >/dev/null 2>&1; then
     echo 'reset unexpectedly retained session-owned downloads' >&2

@@ -283,24 +283,24 @@ fn router_from_state(state: Arc<ServiceState>) -> Router {
         target: RfbTarget::Tcp(state.config.rfb_addr),
     });
     let api = Router::new()
-        .route("/v1/health", get(health))
-        .route("/v1/capabilities", get(capabilities))
-        .route("/v1/observations", post(observe))
-        .route("/v1/images/{image_id}", get(image))
-        .route("/v1/actions", post(actions))
-        .route("/v1/windows", get(windows))
-        .route("/v1/windows/focus", post(focus_window))
-        .route("/v1/clipboard", get(read_clipboard).put(write_clipboard))
-        .route("/v1/launch", post(launch))
-        .route("/v1/accessibility", get(accessibility))
-        .route("/v1/processes", post(spawn_process))
-        .route("/v1/processes/{process_id}", get(process_status).delete(kill_process))
-        .route("/v1/processes/{process_id}/output", get(process_output))
+        .route("/v2/health", get(health))
+        .route("/v2/capabilities", get(capabilities))
+        .route("/v2/observations", post(observe))
+        .route("/v2/images/{image_id}", get(image))
+        .route("/v2/actions", post(actions))
+        .route("/v2/windows", get(windows))
+        .route("/v2/windows/focus", post(focus_window))
+        .route("/v2/clipboard", get(read_clipboard).put(write_clipboard))
+        .route("/v2/launch", post(launch))
+        .route("/v2/accessibility", get(accessibility))
+        .route("/v2/processes", post(spawn_process))
+        .route("/v2/processes/{process_id}", get(process_status).delete(kill_process))
+        .route("/v2/processes/{process_id}/output", get(process_output))
         .with_state(Arc::clone(&state))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, API_TIMEOUT));
     let files = Router::new()
-        .route("/v1/files/{scope}/{*path}", get(read_file).put(write_file).delete(delete_file))
+        .route("/v2/files/{scope}/{*path}", get(read_file).put(write_file).delete(delete_file))
         .with_state(Arc::clone(&state))
         .layer(DefaultBodyLimit::max(MAX_FILE_BYTES));
     Router::new().merge(api).merge(files).merge(viewer)
@@ -377,6 +377,7 @@ async fn capabilities(
     Ok(Json(CapabilityReport {
         protocol: PROTOCOL_VERSION,
         geometry: state.driver.geometry(),
+        hardware_acceleration: state.driver.hardware_acceleration(),
         actions: [
             "move",
             "click",
@@ -1129,7 +1130,7 @@ async fn store_capture(
         height: capture.height,
         coordinate_space: CoordinateSpace::Desktop { display_id: "primary".into() },
         cursor_included: capture.cursor_included,
-        href: format!("/v1/images/{image_id}"),
+        href: format!("/v2/images/{image_id}"),
     };
     state
         .images
@@ -1148,7 +1149,7 @@ async fn store_capture(
         cursor: capture.cursor,
         active_window: None,
         accessibility: AccessibilityStatus::Degraded {
-            reason: "bounded AT-SPI data is available from /v1/accessibility".into(),
+            reason: "bounded AT-SPI data is available from /v2/accessibility".into(),
         },
     })
 }
@@ -1244,7 +1245,7 @@ mod tests {
     async fn health_requires_authentication() {
         let app = router(test_config(), Arc::new(FakeDriver { executions: AtomicUsize::new(0) }));
         let response = app
-            .oneshot(Request::builder().uri("/v1/health").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/v2/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -1261,7 +1262,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/v1/capabilities")
+                    .uri("/v2/capabilities")
                     .header(AUTHORIZATION, bearer())
                     .body(Body::empty())
                     .unwrap(),
@@ -1273,15 +1274,16 @@ mod tests {
         let capabilities: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(capabilities["files"], false);
         assert_eq!(capabilities["process"], false);
+        assert_eq!(capabilities["hardware_acceleration"], false);
 
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/processes")
+                    .uri("/v2/processes")
                     .header(AUTHORIZATION, bearer())
                     .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"protocol":1,"argv":["/bin/true"],"cwd":null}"#))
+                    .body(Body::from(r#"{"protocol":2,"argv":["/bin/true"],"cwd":null}"#))
                     .unwrap(),
             )
             .await
@@ -1299,10 +1301,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/observations")
+                    .uri("/v2/observations")
                     .header(AUTHORIZATION, bearer())
                     .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"protocol":1,"surprise":true}"#))
+                    .body(Body::from(r#"{"protocol":2,"surprise":true}"#))
                     .unwrap(),
             )
             .await
@@ -1327,7 +1329,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/observations")
+                    .uri("/v2/observations")
                     .header(AUTHORIZATION, bearer())
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(capture))
@@ -1374,7 +1376,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/v1/actions")
+                        .uri("/v2/actions")
                         .header(AUTHORIZATION, bearer())
                         .header(CONTENT_TYPE, "application/json")
                         .body(Body::from(body.clone()))
@@ -1391,7 +1393,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/actions")
+                    .uri("/v2/actions")
                     .header(AUTHORIZATION, bearer())
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(serde_json::to_vec(&stale).unwrap()))

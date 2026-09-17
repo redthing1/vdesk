@@ -35,7 +35,7 @@ one durable desktop, and `vdesk view` lets a person help immediately.
 - `service.rs`: authenticated API, action serialization, resources, files, and
   managed processes.
 - `desktop.rs`: X11 capture/input, windows, clipboard, launch, and AT-SPI bridge.
-- `supervisor.rs`: D-Bus, Xvfb, Xfce, x11vnc, readiness, and shutdown.
+- `supervisor.rs`: D-Bus, Xvnc/Xvfb, Xfce, x11vnc, readiness, and shutdown.
 - `viewer.rs`: authenticated WebSocket bridge to one fixed private RFB target.
 - `state.rs`: private descriptors, credentials, and runtime generations.
 - `container/Containerfile`: neutral runtime artifacts plus managed images.

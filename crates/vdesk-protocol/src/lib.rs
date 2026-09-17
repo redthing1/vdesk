@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_ACTIONS_PER_BATCH: usize = 64;
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_KEYS_PER_CHORD: usize = 8;
@@ -538,6 +538,7 @@ pub struct HealthResponse {
 pub struct CapabilityReport {
     pub protocol: u16,
     pub geometry: Geometry,
+    pub hardware_acceleration: bool,
     pub actions: Vec<String>,
     pub screenshot_formats: Vec<String>,
     pub accessibility: bool,
@@ -793,7 +794,7 @@ mod tests {
     #[test]
     fn batch_defaults_are_explicit() {
         let input = r#"{
-          "protocol":1,
+          "protocol":2,
           "request_id":"req-1",
           "actions":[{"type":"click","x":0,"y":0}]
         }"#;
@@ -849,7 +850,7 @@ mod tests {
     fn error_envelope_has_stable_shape() {
         let value =
             serde_json::to_value(ErrorEnvelope::new(ErrorCode::Unauthorized, "nope")).unwrap();
-        assert_eq!(value["protocol"], 1);
+        assert_eq!(value["protocol"], PROTOCOL_VERSION);
         assert_eq!(value["ok"], false);
         assert_eq!(value["error"]["code"], "unauthorized");
         assert!(value["error"].get("details").is_none());

@@ -28,6 +28,9 @@ pub struct DriverCapture {
 
 pub trait DesktopDriver: Send + Sync {
     fn geometry(&self) -> Geometry;
+    fn hardware_acceleration(&self) -> bool {
+        false
+    }
     fn capture(&self, request: &CaptureRequest) -> Result<DriverCapture>;
     fn execute(&self, action: &Action) -> Result<()>;
     fn release_held_input(&self) -> Result<()>;
@@ -62,6 +65,7 @@ struct ScriptAccessibility {
 pub struct X11Driver {
     display: String,
     geometry: Geometry,
+    hardware_acceleration: bool,
     session_bus: Option<String>,
 }
 
@@ -71,6 +75,12 @@ impl X11Driver {
         let (connection, screen_number) = x11rb::connect(Some(&display))
             .with_context(|| format!("connect to X display {display}"))?;
         let screen = &connection.setup().roots[screen_number];
+        let hardware_acceleration = connection
+            .query_extension(b"DRI3")
+            .context("query X11 DRI3 extension")?
+            .reply()
+            .context("read X11 DRI3 extension reply")?
+            .present;
         let geometry = Geometry {
             width: u32::from(screen.width_in_pixels),
             height: u32::from(screen.height_in_pixels),
@@ -78,7 +88,7 @@ impl X11Driver {
             scale,
         };
         geometry.validate().context("validate X display geometry")?;
-        Ok(Self { display, geometry, session_bus: None })
+        Ok(Self { display, geometry, hardware_acceleration, session_bus: None })
     }
 
     pub fn with_session_bus(mut self, address: impl Into<String>) -> Self {
@@ -360,6 +370,10 @@ impl X11Driver {
 impl DesktopDriver for X11Driver {
     fn geometry(&self) -> Geometry {
         self.geometry
+    }
+
+    fn hardware_acceleration(&self) -> bool {
+        self.hardware_acceleration
     }
 
     fn capture(&self, request: &CaptureRequest) -> Result<DriverCapture> {

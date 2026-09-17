@@ -38,6 +38,7 @@ struct RuntimeConfig {
     scale: u16,
     rfb_addr: SocketAddr,
     human_input_socket: PathBuf,
+    xvnc_rfb_socket: PathBuf,
     dbus_address: String,
     dbus_socket: PathBuf,
     workspace_root: Option<PathBuf>,
@@ -115,6 +116,10 @@ impl RuntimeConfig {
             },
             |root| root.join("human-input.sock"),
         );
+        let xvnc_rfb_socket = local_root.map_or_else(
+            || PathBuf::from("/run/vdesk/xvnc-rfb.sock"),
+            |root| root.join("xvnc-rfb.sock"),
+        );
         let dbus_address = local_root.map_or_else(
             || {
                 env::var("DBUS_SESSION_BUS_ADDRESS")
@@ -146,6 +151,7 @@ impl RuntimeConfig {
             scale,
             rfb_addr,
             human_input_socket,
+            xvnc_rfb_socket,
             dbus_address,
             dbus_socket,
             workspace_root: if args.local {
@@ -202,6 +208,7 @@ pub async fn run(args: ServeArgs, session_name: &str) -> Result<()> {
     for child in children.iter_mut().rev() {
         child.terminate().await;
     }
+    let _ = remove_stale_socket(&config.xvnc_rfb_socket, "Xvnc RFB");
     if let Some(store) = &config.local_store {
         store.remove(config.session_id)?;
     }
@@ -242,32 +249,17 @@ pub async fn rfb_stdio() -> Result<()> {
 }
 
 async fn run_inner(config: &RuntimeConfig, children: &mut Vec<ManagedChild>) -> Result<()> {
-    remove_stale_socket(&config.dbus_socket)?;
+    remove_stale_socket(&config.dbus_socket, "D-Bus")?;
     let dbus = spawn(
         "dbus-daemon",
         ["--session", "--nofork", "--nopidfile", &format!("--address={}", config.dbus_address)],
         &[],
     )?;
     children.push(dbus);
-    wait_for_socket(&config.dbus_socket, "D-Bus").await?;
+    wait_for_socket(&config.dbus_socket, "D-Bus", children).await?;
 
-    let xvfb = spawn(
-        "Xvfb",
-        [
-            config.display.as_str(),
-            "-screen",
-            "0",
-            &format!("{}x{}x24", config.width, config.height),
-            "-dpi",
-            &config.dpi.to_string(),
-            "-nolisten",
-            "tcp",
-            "-ac",
-        ],
-        &[],
-    )?;
-    children.push(xvfb);
-    wait_for_display(config).await?;
+    children.push(spawn_display(config)?);
+    wait_for_display(config, children).await?;
 
     let desktop = spawn(
         "xfce4-session",
@@ -310,7 +302,7 @@ async fn run_inner(config: &RuntimeConfig, children: &mut Vec<ManagedChild>) -> 
         &[("DISPLAY", &config.display)],
     )?;
     children.push(x11vnc);
-    wait_for_tcp(config.rfb_addr).await?;
+    wait_for_tcp(config.rfb_addr, children).await?;
 
     let driver = Arc::new(
         X11Driver::connect(&config.display, config.dpi, config.scale)?
@@ -404,12 +396,72 @@ where
     Ok(ManagedChild { name: program, child })
 }
 
-async fn wait_for_display(config: &RuntimeConfig) -> Result<()> {
+fn spawn_display(config: &RuntimeConfig) -> Result<ManagedChild> {
+    if let Some(program) = ["Xvnc", "Xtigervnc"].into_iter().find(|name| command_exists(name)) {
+        remove_stale_socket(&config.xvnc_rfb_socket, "Xvnc RFB")?;
+        return spawn(
+            program,
+            [
+                config.display.clone(),
+                "-geometry".into(),
+                format!("{}x{}", config.width, config.height),
+                "-depth".into(),
+                "24".into(),
+                "-dpi".into(),
+                config.dpi.to_string(),
+                "-nolisten".into(),
+                "tcp".into(),
+                "-ac".into(),
+                "-rfbport".into(),
+                "-1".into(),
+                "-rfbunixpath".into(),
+                config.xvnc_rfb_socket.display().to_string(),
+                "-rfbunixmode".into(),
+                "0600".into(),
+                "-SecurityTypes".into(),
+                "None".into(),
+            ],
+            &[],
+        );
+    }
+
+    spawn(
+        "Xvfb",
+        [
+            config.display.as_str(),
+            "-screen",
+            "0",
+            &format!("{}x{}x24", config.width, config.height),
+            "-dpi",
+            &config.dpi.to_string(),
+            "-nolisten",
+            "tcp",
+            "-ac",
+        ],
+        &[],
+    )
+}
+
+fn command_exists(command: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|directory| {
+            let Ok(metadata) = directory.join(command).metadata() else {
+                return false;
+            };
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        })
+    })
+}
+
+async fn wait_for_display(config: &RuntimeConfig, children: &mut [ManagedChild]) -> Result<()> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if X11Driver::connect(&config.display, config.dpi, config.scale).is_ok() {
             return Ok(());
         }
+        ensure_children(children)?;
         if Instant::now() >= deadline {
             bail!("X display did not become ready within {STARTUP_TIMEOUT:?}");
         }
@@ -417,12 +469,13 @@ async fn wait_for_display(config: &RuntimeConfig) -> Result<()> {
     }
 }
 
-async fn wait_for_tcp(address: SocketAddr) -> Result<()> {
+async fn wait_for_tcp(address: SocketAddr, children: &mut [ManagedChild]) -> Result<()> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if tokio::net::TcpStream::connect(address).await.is_ok() {
             return Ok(());
         }
+        ensure_children(children)?;
         if Instant::now() >= deadline {
             bail!("RFB service did not become ready within {STARTUP_TIMEOUT:?}");
         }
@@ -466,12 +519,13 @@ async fn visible_window_exists(display: &str, name: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-async fn wait_for_socket(path: &Path, name: &str) -> Result<()> {
+async fn wait_for_socket(path: &Path, name: &str, children: &mut [ManagedChild]) -> Result<()> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if tokio::net::UnixStream::connect(path).await.is_ok() {
             return Ok(());
         }
+        ensure_children(children)?;
         if Instant::now() >= deadline {
             bail!("{name} did not become ready within {STARTUP_TIMEOUT:?}");
         }
@@ -479,14 +533,14 @@ async fn wait_for_socket(path: &Path, name: &str) -> Result<()> {
     }
 }
 
-fn remove_stale_socket(path: &Path) -> Result<()> {
+fn remove_stale_socket(path: &Path, name: &str) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
 
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => {
             std::fs::remove_file(path).with_context(|| format!("remove stale {}", path.display()))
         }
-        Ok(_) => bail!("refusing non-socket D-Bus path at {}", path.display()),
+        Ok(_) => bail!("refusing non-socket {name} path at {}", path.display()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
     }

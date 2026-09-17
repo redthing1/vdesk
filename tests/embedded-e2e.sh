@@ -38,7 +38,8 @@ while test "$attempt" -lt 30; do
     sleep 0.2
 done
 test "$attempt" -lt 30
-jq -e '.protocol == 1 and .files == false and .process == false and .viewer == true' \
+jq -e '.protocol == 2 and .hardware_acceleration == false and
+        .files == false and .process == false and .viewer == true' \
     "$temporary/capabilities.json" >/dev/null
 if "$engine" exec "$container" vdesk --session another capabilities >/dev/null 2>&1; then
     printf 'a differently named session unexpectedly selected the local runtime\n' >&2
