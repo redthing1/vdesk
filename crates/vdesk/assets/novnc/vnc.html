@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vdesk</title>
+  <style>
+    :root { color-scheme: dark; font: 14px system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; height: 100vh; display: grid; grid-template-rows: auto 1fr; background: #111; }
+    header { display: flex; align-items: center; gap: .75rem; padding: .45rem .65rem; background: #242424; }
+    #status { flex: 1; color: #bbb; }
+    button { border: 1px solid #555; border-radius: .3rem; padding: .3rem .6rem; color: inherit; background: #333; }
+    button:hover { background: #444; }
+    #screen { min-width: 0; min-height: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>vdesk</strong>
+    <span id="status">Connecting…</span>
+    <button id="cad" type="button">Ctrl-Alt-Del</button>
+  </header>
+  <main id="screen"></main>
+  <script type="module" src="viewer.js"></script>
+</body>
+</html>

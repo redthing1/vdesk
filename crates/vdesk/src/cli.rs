@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -15,8 +16,10 @@ use vdesk_protocol::{Action, ActionBatchRequest, BatchStatus, Geometry, MouseBut
 use crate::client::{DesktopClient, write_atomic};
 use crate::engine::{ContainerInspection, Engine};
 use crate::state::{
-    EngineKind, SessionDescriptor, StateStore, load_client_descriptor, validate_session_name,
+    EngineKind, LocalRuntimeStore, Secret, SessionDescriptor, StateStore, load_client_descriptor,
+    validate_session_name,
 };
+use crate::viewer::{self, RfbTarget, ViewerConfig};
 use crate::{pipe_input, supervisor};
 
 #[derive(Debug, Parser)]
@@ -92,8 +95,10 @@ pub enum Commands {
     Delete,
     /// Launch an agent container beside its desktop.
     Run(RunArgs),
-    #[command(hide = true)]
+    /// Run the desktop runtime in the foreground.
     Serve(ServeArgs),
+    #[command(hide = true)]
+    RfbStdio,
     #[command(hide = true)]
     PipeInput(PipeInputArgs),
 }
@@ -329,6 +334,9 @@ pub struct ViewArgs {
     /// Print the URL without opening a browser.
     #[arg(long)]
     pub print_url: bool,
+    /// Explicit argv used to reach an embedded runtime's `vdesk rfb-stdio`.
+    #[arg(last = true)]
+    pub transport: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -341,8 +349,18 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    #[arg(long, default_value = "0.0.0.0:7777")]
-    pub bind: String,
+    /// Publish a private descriptor for clients in this Linux environment.
+    #[arg(long)]
+    pub local: bool,
+    /// Service listen address. Defaults to loopback/ephemeral locally.
+    #[arg(long)]
+    pub bind: Option<String>,
+    /// Safe workspace root for optional file and process operations.
+    #[arg(long, requires = "local")]
+    pub workspace_root: Option<PathBuf>,
+    /// Safe downloads root for optional file and process operations.
+    #[arg(long, requires = "local")]
+    pub downloads_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -438,12 +456,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Process(args) => process(&session, args, json).await,
         Commands::Import(args) => import_file(&session, args, json).await,
         Commands::Export(args) => export_file(&session, args, json).await,
-        Commands::View(args) => view(&session, args, json),
+        Commands::View(args) => view(&session, args, json).await,
         Commands::Stop => stop(&session, json).await,
         Commands::Reset => reset(&session, json).await,
         Commands::Delete => delete(&session, json).await,
         Commands::Run(args) => run_agent(&session, args).await,
-        Commands::Serve(args) => supervisor::run(args).await,
+        Commands::Serve(args) => supervisor::run(args, &session).await,
+        Commands::RfbStdio => supervisor::rfb_stdio().await,
         Commands::PipeInput(args) => pipe_input::run(&args.socket),
     }
 }
@@ -704,7 +723,7 @@ async fn sessions(json_output: bool) -> Result<()> {
 }
 
 async fn capabilities(name: &str, json_output: bool) -> Result<()> {
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let value = client.capabilities().await?;
     if json_output {
         print_json(&value)
@@ -715,7 +734,7 @@ async fn capabilities(name: &str, json_output: bool) -> Result<()> {
 }
 
 async fn a11y(name: &str, json_output: bool) -> Result<()> {
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let snapshot = client.accessibility().await?;
     if json_output {
         print_json(&snapshot)
@@ -742,7 +761,7 @@ async fn a11y(name: &str, json_output: bool) -> Result<()> {
 }
 
 async fn see(name: &str, args: SeeArgs, json_output: bool) -> Result<()> {
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let observation = client.observe(args.include_cursor).await?;
     let bytes = client.image(&observation).await?;
     write_atomic(&args.output, &bytes)?;
@@ -762,7 +781,7 @@ async fn see(name: &str, args: SeeArgs, json_output: bool) -> Result<()> {
 }
 
 async fn cursor(name: &str, json_output: bool) -> Result<()> {
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let observation = client.observe(false).await?;
     let output = json!({
         "cursor": observation.cursor,
@@ -782,7 +801,7 @@ async fn cursor(name: &str, json_output: bool) -> Result<()> {
 }
 
 async fn action(name: &str, actions: Vec<Action>, json_output: bool) -> Result<()> {
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let result = client.actions(actions, None, ObserveMode::Final).await?;
     if json_output {
         print_json(&result)
@@ -827,7 +846,7 @@ async fn batch(name: &str, args: BatchArgs, json_output: bool) -> Result<()> {
     let bytes = fs::read(&args.input).context("read action batch")?;
     let request: ActionBatchRequest =
         serde_json::from_slice(&bytes).context("parse action batch JSON")?;
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let result = client.action_batch(&request).await?;
     if json_output {
         print_json(&result)
@@ -843,7 +862,7 @@ async fn batch(name: &str, args: BatchArgs, json_output: bool) -> Result<()> {
 }
 
 async fn windows(name: &str, args: WindowsArgs, json_output: bool) -> Result<()> {
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let list = match args.focus {
         Some(window_id) => client.focus_window(window_id).await?,
         None => client.windows().await?,
@@ -871,7 +890,7 @@ async fn windows(name: &str, args: WindowsArgs, json_output: bool) -> Result<()>
 }
 
 async fn clipboard(name: &str, args: ClipboardArgs, json_output: bool) -> Result<()> {
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     match args.command {
         ClipboardCommand::Get => {
             let content = client.read_clipboard().await?;
@@ -898,7 +917,7 @@ async fn clipboard(name: &str, args: ClipboardArgs, json_output: bool) -> Result
 }
 
 async fn launch(name: &str, args: LaunchArgs, json_output: bool) -> Result<()> {
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let mut argv = vec![args.application];
     argv.extend(args.args);
     let result = client.launch(argv).await?;
@@ -911,7 +930,7 @@ async fn launch(name: &str, args: LaunchArgs, json_output: bool) -> Result<()> {
 }
 
 async fn process(name: &str, args: ProcessArgs, json_output: bool) -> Result<()> {
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     match args.command {
         ProcessCommand::Start(args) => {
             let info = client.spawn_process(args.argv, args.cwd.map(Into::into)).await?;
@@ -994,7 +1013,7 @@ async fn import_file(name: &str, args: TransferArgs, json_output: bool) -> Resul
     }
     let bytes = fs::read(&args.source).context("read import source")?;
     let (scope, path) = parse_remote_path(&args.destination)?;
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let result = client.import_file(scope, &path, bytes).await?;
     if json_output {
         print_json(&result)
@@ -1012,7 +1031,7 @@ async fn import_file(name: &str, args: TransferArgs, json_output: bool) -> Resul
 
 async fn export_file(name: &str, args: TransferArgs, json_output: bool) -> Result<()> {
     let (scope, path) = parse_remote_path(&args.source)?;
-    let client = load_client(name)?;
+    let client = load_client(name).await?;
     let bytes = client.export_file(scope, &path).await?;
     write_atomic(&args.destination, &bytes)?;
     if json_output {
@@ -1027,7 +1046,10 @@ async fn export_file(name: &str, args: TransferArgs, json_output: bool) -> Resul
     }
 }
 
-fn view(name: &str, args: ViewArgs, json_output: bool) -> Result<()> {
+async fn view(name: &str, args: ViewArgs, json_output: bool) -> Result<()> {
+    if !args.transport.is_empty() {
+        return view_over_command(args, json_output).await;
+    }
     let store = StateStore::discover()?;
     let descriptor = store.load(name)?;
     let url = viewer_url(&descriptor);
@@ -1039,8 +1061,37 @@ fn view(name: &str, args: ViewArgs, json_output: bool) -> Result<()> {
         }
         return Ok(());
     }
+    open_browser(&url)
+}
+
+async fn view_over_command(args: ViewArgs, json_output: bool) -> Result<()> {
+    let listener =
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind embedded viewer")?;
+    let address = listener.local_addr().context("read embedded viewer address")?;
+    let token = Secret::generate()?;
+    let url = viewer_url_parts(&format!("http://{address}"), token.expose());
+    if json_output {
+        print_json(&json!({ "mode": "embedded", "url": url }))?;
+    } else if args.print_url {
+        println!("{url}");
+    } else if let Err(error) = open_browser(&url) {
+        eprintln!("{error:#}");
+    }
+    let app = viewer::router(ViewerConfig {
+        token,
+        target: RfbTarget::Command(Arc::from(args.transport)),
+    });
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .context("serve embedded viewer")
+}
+
+fn open_browser(url: &str) -> Result<()> {
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    match Command::new(opener).arg(&url).spawn() {
+    match Command::new(opener).arg(url).spawn() {
         Ok(_) => Ok(()),
         Err(error) => {
             println!("{url}");
@@ -1136,10 +1187,27 @@ async fn run_agent(name: &str, args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_client(name: &str) -> Result<DesktopClient> {
+async fn load_client(name: &str) -> Result<DesktopClient> {
     if let Some(path) = std::env::var_os("VDESK_DESCRIPTOR") {
         let descriptor = load_client_descriptor(Path::new(&path))?;
         return DesktopClient::from_client_descriptor(&descriptor);
+    }
+    let local_store = LocalRuntimeStore::discover()?;
+    if let Some(descriptor) = local_store.load()?
+        && descriptor.name == name
+    {
+        let client = DesktopClient::from_client_descriptor(&descriptor)?;
+        match client.health().await {
+            Ok(health)
+                if health.ready
+                    && health.session_id == descriptor.session_id.to_string()
+                    && health.runtime_generation == descriptor.runtime_generation =>
+            {
+                return Ok(client);
+            }
+            Ok(_) => local_store.remove(descriptor.session_id)?,
+            Err(_) => {}
+        }
     }
     let descriptor = StateStore::discover()?.load(name)?;
     DesktopClient::for_host(&descriptor)
@@ -1188,10 +1256,14 @@ fn scope_name(scope: vdesk_protocol::FileScope) -> &'static str {
 }
 
 fn viewer_url(descriptor: &SessionDescriptor) -> String {
+    viewer_url_parts(&descriptor.host_endpoint, descriptor.viewer_token.expose())
+}
+
+fn viewer_url_parts(endpoint: &str, token: &str) -> String {
     format!(
-        "{}/novnc/vnc.html?autoconnect=1&resize=scale&path=viewer%2Fws%3Ftoken%3D{}",
-        descriptor.host_endpoint.trim_end_matches('/'),
-        descriptor.viewer_token.expose()
+        "{}/novnc/vnc.html?path=viewer%2Fws%3Ftoken%3D{}",
+        endpoint.trim_end_matches('/'),
+        token
     )
 }
 
@@ -1365,6 +1437,27 @@ mod tests {
             panic!("wrong command");
         };
         assert_eq!(run.command, ["agent", "--flag", "value with spaces"]);
+    }
+
+    #[test]
+    fn embedded_view_transport_is_not_reparsed() {
+        let cli = Cli::try_parse_from([
+            "vdesk",
+            "view",
+            "--",
+            "mim",
+            "exec",
+            "-i",
+            "work",
+            "--",
+            "vdesk",
+            "rfb-stdio",
+        ])
+        .unwrap();
+        let Commands::View(view) = cli.command else {
+            panic!("wrong command");
+        };
+        assert_eq!(view.transport, ["mim", "exec", "-i", "work", "--", "vdesk", "rfb-stdio"]);
     }
 
     #[test]

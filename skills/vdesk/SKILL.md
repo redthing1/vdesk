@@ -32,9 +32,15 @@ Use structured context when helpful:
 Unicode typing uses a verified clipboard paste and leaves the text on the
 desktop clipboard. ASCII typing is direct.
 
-A person can use `vdesk view` on the same live display without a handoff step.
-From an agent container, use the mounted client and descriptor; do not seek an
-engine socket, raw VNC, host display, or shared host path.
+A person can use `vdesk view` on a managed desktop without a handoff step. For
+an embedded desktop, the host passes the environment's ordinary exec vector,
+for example `vdesk view -- mim exec -i work -- vdesk rfb-stdio`.
+
+From a sibling agent container, use the mounted client and descriptor. Inside
+an embedded sandbox, run the same CLI normally; it discovers the local runtime.
+Check `capabilities` before using files or managed processes because embedded
+runtimes expose them only when scoped roots were configured. Do not seek an
+engine socket, raw VNC, host display, or a new shared host path.
 
 Action delivery is not task success. Verify the resulting pixels, structured
 state, process result, or exported file.

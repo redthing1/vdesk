@@ -1,8 +1,15 @@
 # vdesk
 
-`vdesk` gives an agent and a person the same containerized Linux desktop. The
-agent gets exact screenshots and a typed CLI; the person gets an interactive
-noVNC view. Podman is preferred and Docker supports the same workflow.
+`vdesk` gives an agent and a person the same isolated Linux desktop. The agent
+gets exact screenshots and a typed CLI; the person gets an interactive noVNC
+view. One runtime supports two deliberately small deployment shapes:
+
+- `vdesk open` manages a ready-made desktop container.
+- `vdesk serve --local` runs the desktop inside an existing container, mimchine,
+  or VM.
+
+Podman is preferred for managed desktops and Docker has the same public
+behavior. Embedded mode does not need either engine inside the sandbox.
 
 The v1 implementation is tested on amd64 Linux with rootless Podman and Docker.
 
@@ -86,6 +93,39 @@ inspect or help through `vdesk view`.
 
 Agent instructions are in [skills/vdesk/SKILL.md](skills/vdesk/SKILL.md).
 
+## Existing containers and VMs
+
+Install the runtime artifacts and graphical packages in the existing image,
+then run one foreground process:
+
+```sh
+exec vdesk serve --local
+```
+
+Commands inside that same sandbox discover it automatically:
+
+```sh
+vdesk capabilities
+vdesk see --output /tmp/desktop.png
+vdesk launch xfce4-terminal
+```
+
+To help from the host, pass the sandbox's ordinary interactive exec command as
+an explicit argv vector:
+
+```sh
+vdesk view -- mim exec -i work -- vdesk rfb-stdio
+vdesk view -- podman exec -i work vdesk rfb-stdio
+```
+
+The noVNC client is built into the host binary. The bridge exposes only the
+runtime's fixed private RFB endpoint; it is not a general proxy. There is no
+second container, published port, engine socket, shared display, or
+vdesk-specific provider integration.
+
+See [doc/embedded.md](doc/embedded.md) for image integration, the optional
+mimchine startup hook, scoped files/processes, and the trust boundary.
+
 ## Images
 
 ```sh
@@ -93,13 +133,21 @@ vdesk image build --profile minimal --tag localhost/vdesk:minimal
 vdesk image build --profile default --tag localhost/vdesk:dev
 ```
 
-The minimal image contains Xvfb, Xfce, x11vnc, noVNC, AT-SPI, and the vdesk
+The minimal image contains Xvfb, Xfce, x11vnc, AT-SPI, and the vdesk
 service. The default image adds Chromium, Mousepad, and Thunar.
+
+The `artifacts` target contains only the static binary and AT-SPI helper. Copy it
+into any image and install that distribution's graphical packages; vdesk does
+not replace the image's user, HOME, workdir, entrypoint, or lifecycle.
 
 The desktop runs as a non-root user with dropped capabilities,
 `no-new-privileges`, resource limits, one scoped workspace mount, and no engine
 socket. It is a shared-kernel container, not a hostile multi-tenant VM.
 Chromium currently uses `--no-sandbox` inside that container.
+
+The current Xvfb backend is software-rendered. Proper GUI GPU acceleration
+requires a different display backend as well as explicit device delegation;
+passing `/dev/dri` to Xvfb alone is not presented as acceleration.
 
 ## Develop
 
@@ -110,6 +158,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 VDESK_AGENT_TESTS=1 tests/e2e.sh podman
 VDESK_AGENT_TESTS=1 tests/e2e.sh docker
+tests/embedded-e2e.sh podman
+tests/embedded-e2e.sh docker
 ```
 
 The E2E suite additionally needs `curl`, `jq`, and Bun. See

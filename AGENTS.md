@@ -1,15 +1,16 @@
 # Working on vdesk
 
-vdesk is a small, provider-neutral executor for a containerized graphical Linux
-desktop. Keep the common path simple: short-lived CLI calls operate one durable
-desktop, and `vdesk view` lets a person help immediately.
+vdesk is a small, provider-neutral executor for an isolated graphical Linux
+desktop. The same runtime works in a vdesk-managed OCI desktop or inside an
+existing sandbox. Keep the common path simple: short-lived CLI calls operate
+one durable desktop, and `vdesk view` lets a person help immediately.
 
 ## Invariants
 
 - Keep one public CLI and one versioned data-plane protocol.
 - Podman is preferred; Docker must retain the same public behavior.
-- The trusted host owns container lifecycle. The desktop service owns display
-  state and serializes agent actions.
+- The outer trusted environment owns lifecycle. The desktop service owns
+  display state and serializes agent actions.
 - An ordinary agent container must never receive the host engine socket,
   lifecycle credentials, host display, or arbitrary host mounts.
 - noVNC is the human interface. Agent observations come directly from the
@@ -19,8 +20,8 @@ desktop, and `vdesk view` lets a person help immediately.
 - Do not report action delivery as application-level success.
 - Keep shell execution explicit. Process and application APIs accept argv;
   never construct shell commands from agent input.
-- Keep file access beneath `/workspace` and `/downloads`, with bytes crossing
-  the protocol rather than shared-path assumptions.
+- Keep file access beneath the explicitly configured workspace/download roots,
+  with bytes crossing the protocol rather than shared-path assumptions.
 - Prefer a small ordinary interface over plugins, policy languages, brokers,
   or host daemons. Add machinery only for a demonstrated workflow.
 
@@ -37,8 +38,9 @@ desktop, and `vdesk view` lets a person help immediately.
 - `supervisor.rs`: D-Bus, Xvfb, Xfce, x11vnc, readiness, and shutdown.
 - `viewer.rs`: authenticated WebSocket bridge to one fixed private RFB target.
 - `state.rs`: private descriptors, credentials, and runtime generations.
-- `container/Containerfile`: static client build plus minimal/default images.
-- `tests/e2e.sh`: real Podman/Docker behavior and boundary checks.
+- `container/Containerfile`: neutral runtime artifacts plus managed images.
+- `tests/e2e.sh`: managed Podman/Docker behavior and boundary checks.
+- `tests/embedded-e2e.sh`: in-sandbox runtime and exec-transport viewer checks.
 
 ## Before changing behavior
 
@@ -70,6 +72,8 @@ image and run:
 ```sh
 VDESK_AGENT_TESTS=1 tests/e2e.sh podman
 VDESK_AGENT_TESTS=1 tests/e2e.sh docker
+tests/embedded-e2e.sh podman
+tests/embedded-e2e.sh docker
 ```
 
 The E2E suite needs `curl`, `jq`, and Bun. It owns a uniquely named session and

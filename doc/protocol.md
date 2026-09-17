@@ -125,3 +125,20 @@ output.
 The endpoint list is intentionally narrow: health, capabilities, observations,
 images, actions, windows, accessibility, clipboard, launch, processes, and files.
 It does not expose container lifecycle or arbitrary shell execution.
+
+## Deployment independence
+
+Protocol v1 is identical in managed and embedded deployments. A client
+descriptor carries only an endpoint, data token, session identity, geometry,
+and runtime generation; it never carries an engine kind, container name,
+machine name, host path, lifecycle credential, or viewer credential.
+
+`files` and `process` in the capabilities response are deployment facts. They
+are `false` when an embedded runtime has no explicit workspace/download roots,
+and those endpoints return `capability_unavailable`. Clients must inspect
+capabilities instead of assuming the managed image's `/workspace` and
+`/downloads` convention.
+
+The embedded `rfb-stdio` command is a viewer transport, not a data-plane
+endpoint or protocol extension. It validates the local runtime and connects to
+one fixed private RFB address. The public HTTP/JSON contract remains unchanged.

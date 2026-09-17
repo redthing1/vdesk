@@ -34,7 +34,7 @@ use vdesk_protocol::{
 
 use crate::desktop::{DesktopDriver, DriverCapture};
 use crate::state::Secret;
-use crate::viewer::{self, ViewerConfig};
+use crate::viewer::{self, RfbTarget, ViewerConfig};
 
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
@@ -50,14 +50,15 @@ const DRIVER_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
-    pub bind: SocketAddr,
     pub session_id: String,
     pub runtime_generation: u64,
     pub data_token: Secret,
     pub viewer_token: Secret,
-    pub novnc_dir: PathBuf,
     pub rfb_addr: SocketAddr,
     pub human_input_socket: Option<PathBuf>,
+    pub workspace_root: Option<PathBuf>,
+    pub downloads_root: Option<PathBuf>,
+    pub process_environment: Vec<(String, String)>,
 }
 
 pub struct ServiceState {
@@ -279,8 +280,7 @@ pub fn router(config: ServiceConfig, driver: Arc<dyn DesktopDriver>) -> Router {
 fn router_from_state(state: Arc<ServiceState>) -> Router {
     let viewer = viewer::router(ViewerConfig {
         token: state.config.viewer_token.clone(),
-        rfb_addr: state.config.rfb_addr,
-        novnc_dir: state.config.novnc_dir.clone(),
+        target: RfbTarget::Tcp(state.config.rfb_addr),
     });
     let api = Router::new()
         .route("/v1/health", get(health))
@@ -306,12 +306,12 @@ fn router_from_state(state: Arc<ServiceState>) -> Router {
     Router::new().merge(api).merge(files).merge(viewer)
 }
 
-pub async fn serve(
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
     config: ServiceConfig,
     driver: Arc<dyn DesktopDriver>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let bind = config.bind;
     let human_input_socket = config.human_input_socket.clone();
     let state = ServiceState::new(config, driver);
     let human_listener = if let Some(path) = human_input_socket {
@@ -320,7 +320,6 @@ pub async fn serve(
     } else {
         None
     };
-    let listener = tokio::net::TcpListener::bind(bind).await?;
     let result =
         axum::serve(listener, router_from_state(state)).with_graceful_shutdown(shutdown).await;
     if let Some(task) = human_listener {
@@ -399,8 +398,8 @@ async fn capabilities(
         accessibility: true,
         windows: true,
         clipboard: true,
-        files: true,
-        process: true,
+        files: scoped_roots_available(&state.config),
+        process: scoped_roots_available(&state.config),
         viewer: true,
         limits: ProtocolLimits::default(),
     }))
@@ -541,13 +540,12 @@ async fn spawn_process(
     validate_protocol_value(request.protocol)?;
     validate_argv(&request.argv)?;
     let (program, args) = request.argv.split_first().expect("validated non-empty argv");
+    let cwd = configured_scope_root(&state.config, request.cwd.unwrap_or(FileScope::Workspace))?;
     let mut command = Command::new(program);
     command
         .args(args)
-        .current_dir(match request.cwd.unwrap_or(FileScope::Workspace) {
-            FileScope::Workspace => "/workspace",
-            FileScope::Downloads => "/downloads",
-        })
+        .envs(state.config.process_environment.iter().cloned())
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -703,7 +701,7 @@ async fn read_file(
     Path((scope, path)): Path<(String, String)>,
 ) -> Result<Response, ApiFailure> {
     authorize(&headers, &state.config.data_token)?;
-    let (scope, target) = resolve_scoped_file(&scope, &path, false)?;
+    let (scope, target) = resolve_scoped_file(&state.config, &scope, &path, false)?;
     let metadata = fs::metadata(&target).map_err(|_| {
         ApiFailure::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, "file not found")
     })?;
@@ -738,7 +736,7 @@ async fn write_file(
     body: Body,
 ) -> Result<Json<FileMetadata>, ApiFailure> {
     authorize(&headers, &state.config.data_token)?;
-    let (scope, target) = resolve_scoped_file(&scope, &path, true)?;
+    let (scope, target) = resolve_scoped_file(&state.config, &scope, &path, true)?;
     let bytes = to_bytes(body, MAX_FILE_BYTES)
         .await
         .map_err(|_| ApiFailure::invalid("file exceeds the upload limit"))?;
@@ -763,7 +761,7 @@ async fn delete_file(
     Path((scope, path)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiFailure> {
     authorize(&headers, &state.config.data_token)?;
-    let (_, target) = resolve_scoped_file(&scope, &path, false)?;
+    let (_, target) = resolve_scoped_file(&state.config, &scope, &path, false)?;
     let metadata = fs::symlink_metadata(&target).map_err(|_| {
         ApiFailure::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, "file not found")
     })?;
@@ -775,15 +773,17 @@ async fn delete_file(
 }
 
 fn resolve_scoped_file(
+    config: &ServiceConfig,
     scope: &str,
     path: &str,
     create_parent: bool,
 ) -> Result<(FileScope, PathBuf), ApiFailure> {
-    let (scope, root) = match scope {
-        "workspace" => (FileScope::Workspace, FsPath::new("/workspace")),
-        "downloads" => (FileScope::Downloads, FsPath::new("/downloads")),
+    let scope = match scope {
+        "workspace" => FileScope::Workspace,
+        "downloads" => FileScope::Downloads,
         _ => return Err(ApiFailure::invalid("file scope must be workspace or downloads")),
     };
+    let root = configured_scope_root(config, scope)?;
     let relative = FsPath::new(path);
     if path.is_empty()
         || relative.is_absolute()
@@ -815,6 +815,24 @@ fn resolve_scoped_file(
         return Err(ApiFailure::invalid("symbolic-link file targets are refused"));
     }
     Ok((scope, safe_target))
+}
+
+fn scoped_roots_available(config: &ServiceConfig) -> bool {
+    config.workspace_root.is_some() && config.downloads_root.is_some()
+}
+
+fn configured_scope_root(config: &ServiceConfig, scope: FileScope) -> Result<&FsPath, ApiFailure> {
+    let root = match scope {
+        FileScope::Workspace => config.workspace_root.as_deref(),
+        FileScope::Downloads => config.downloads_root.as_deref(),
+    };
+    root.ok_or_else(|| {
+        ApiFailure::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorCode::CapabilityUnavailable,
+            "scoped files and processes are unavailable in this runtime",
+        )
+    })
 }
 
 fn validate_protocol_value(protocol: u16) -> Result<(), ApiFailure> {
@@ -1206,14 +1224,15 @@ mod tests {
 
     fn test_config() -> ServiceConfig {
         ServiceConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
             session_id: "test-session".into(),
             runtime_generation: 1,
             data_token: Secret::parse("data-token-1234567890".into()).unwrap(),
             viewer_token: Secret::parse("viewer-token-123456".into()).unwrap(),
-            novnc_dir: PathBuf::from("/does/not/exist"),
             rfb_addr: "127.0.0.1:5900".parse().unwrap(),
             human_input_socket: None,
+            workspace_root: Some(PathBuf::from("/workspace")),
+            downloads_root: Some(PathBuf::from("/downloads")),
+            process_environment: Vec::new(),
         }
     }
 
@@ -1229,6 +1248,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn scoped_capabilities_are_explicitly_optional() {
+        let mut config = test_config();
+        config.workspace_root = None;
+        config.downloads_root = None;
+        let app = router(config, Arc::new(FakeDriver { executions: AtomicUsize::new(0) }));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/capabilities")
+                    .header(AUTHORIZATION, bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let capabilities: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(capabilities["files"], false);
+        assert_eq!(capabilities["process"], false);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/processes")
+                    .header(AUTHORIZATION, bearer())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"protocol":1,"argv":["/bin/true"],"cwd":null}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let envelope: ErrorEnvelope = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envelope.error.code, ErrorCode::CapabilityUnavailable);
     }
 
     #[tokio::test]

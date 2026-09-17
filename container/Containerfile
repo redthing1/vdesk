@@ -12,20 +12,15 @@ RUN apt-get update \
     && rustup target add "$(cat /tmp/rust-target)"
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY crates ./crates
+COPY container/a11y_snapshot.py /source/container/a11y_snapshot.py
 RUN cargo build --locked --release --target "$(cat /tmp/rust-target)" --bin vdesk \
-    && install -D "target/$(cat /tmp/rust-target)/release/vdesk" /out/vdesk
+    && install -D "target/$(cat /tmp/rust-target)/release/vdesk" /out/usr/local/bin/vdesk \
+    && install -D -m 0755 container/a11y_snapshot.py \
+        /out/usr/local/libexec/vdesk-a11y-snapshot
 
-FROM docker.io/library/debian:bookworm-slim AS novnc-assets
+FROM scratch AS artifacts
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && curl --location --fail --silent --show-error \
-        https://github.com/novnc/noVNC/archive/refs/tags/v1.7.0.tar.gz \
-        --output /tmp/novnc.tar.gz \
-    && echo "b1003a11b6e6e8d8f7f5e5586daae7f8ca651d8aee0aa155ff9ac841c48f52c6  /tmp/novnc.tar.gz" \
-        | sha256sum --check --strict \
-    && mkdir /opt/novnc \
-    && tar --extract --gzip --file /tmp/novnc.tar.gz --strip-components=1 --directory /opt/novnc
+COPY --from=builder /out /
 
 FROM docker.io/library/debian:bookworm-slim AS runtime-core
 
@@ -39,7 +34,6 @@ RUN apt-get update \
         dbus-x11 \
         fonts-dejavu-core \
         fonts-liberation \
-        tini \
         x11-utils \
         x11vnc \
         xclip \
@@ -52,24 +46,20 @@ RUN apt-get update \
         xfwm4 \
         xvfb \
         xfce4-terminal \
+        tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 --shell /bin/bash vdesk \
     && install -d -o vdesk -g vdesk -m 0700 /run/vdesk /run/vdesk/user \
-    && install -d -o vdesk -g vdesk -m 0755 /workspace /downloads
+    && install -d -o vdesk -g vdesk -m 0755 /workspace /downloads \
+    && ln -s /usr/local/bin/vdesk /usr/local/bin/vdesk-chromium \
+    && ln -s /usr/local/bin/vdesk-chromium /usr/local/bin/chromium
 
-COPY --from=builder /out/vdesk /usr/local/bin/vdesk
-COPY --from=novnc-assets /opt/novnc /usr/share/novnc
-COPY container/a11y_snapshot.py /usr/local/libexec/vdesk-a11y-snapshot
-
-RUN ln -s /usr/local/bin/vdesk /usr/local/bin/vdesk-chromium \
-    && ln -s /usr/local/bin/vdesk-chromium /usr/local/bin/chromium \
-    && chmod 0755 /usr/local/libexec/vdesk-a11y-snapshot
+COPY --from=artifacts / /
 
 ENV HOME=/home/vdesk \
     USER=vdesk \
     DISPLAY=:99 \
     VDESK_DISPLAY=:99 \
-    VDESK_NOVNC_DIR=/usr/share/novnc \
     XDG_RUNTIME_DIR=/run/vdesk/user \
     DBUS_SESSION_BUS_ADDRESS=unix:path=/run/vdesk/bus \
     NO_AT_BRIDGE=0

@@ -6,21 +6,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncWriteExt, copy};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::cli::ServeArgs;
+use crate::client::DesktopClient;
 use crate::desktop::{DesktopDriver, X11Driver};
 use crate::service::{self, ServiceConfig};
-use crate::state::Secret;
+use crate::state::{
+    ClientDescriptor, DESCRIPTOR_VERSION, LocalRuntimeStore, Secret, validate_session_name,
+};
+use uuid::Uuid;
+use vdesk_protocol::Geometry;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct RuntimeConfig {
     bind: SocketAddr,
-    session_id: String,
+    session_id: Uuid,
+    session_name: String,
     runtime_generation: u64,
     data_token: Secret,
     viewer_token: Secret,
@@ -29,23 +36,56 @@ struct RuntimeConfig {
     height: u32,
     dpi: u16,
     scale: u16,
-    novnc_dir: PathBuf,
     rfb_addr: SocketAddr,
     human_input_socket: PathBuf,
     dbus_address: String,
     dbus_socket: PathBuf,
+    workspace_root: Option<PathBuf>,
+    downloads_root: Option<PathBuf>,
+    local_store: Option<LocalRuntimeStore>,
 }
 
 impl RuntimeConfig {
-    fn from_environment(args: ServeArgs) -> Result<Self> {
-        let bind = args.bind.parse().context("parse service bind address")?;
-        let session_id = required_env("VDESK_SESSION_ID")?;
-        let runtime_generation = env::var("VDESK_RUNTIME_GENERATION")
-            .unwrap_or_else(|_| "1".into())
+    fn from_environment(args: ServeArgs, session_name: &str) -> Result<Self> {
+        let bind: SocketAddr = args
+            .bind
+            .unwrap_or_else(|| if args.local { "127.0.0.1:0" } else { "0.0.0.0:7777" }.into())
             .parse()
-            .context("parse VDESK_RUNTIME_GENERATION")?;
-        let data_token = Secret::parse(required_env("VDESK_DATA_TOKEN")?)?;
-        let viewer_token = Secret::parse(required_env("VDESK_VIEWER_TOKEN")?)?;
+            .context("parse service bind address")?;
+        if args.local && !bind.ip().is_loopback() {
+            bail!("a local runtime must bind its service to a loopback address");
+        }
+        if args.workspace_root.is_some() != args.downloads_root.is_some() {
+            bail!("--workspace-root and --downloads-root must be provided together");
+        }
+        let local_store = args.local.then(LocalRuntimeStore::discover).transpose()?;
+        if let Some(store) = &local_store {
+            store.ensure()?;
+        }
+        let session_id = if args.local {
+            Uuid::new_v4()
+        } else {
+            required_env("VDESK_SESSION_ID")?.parse().context("parse VDESK_SESSION_ID")?
+        };
+        validate_session_name(session_name)?;
+        let runtime_generation = if args.local {
+            1
+        } else {
+            env::var("VDESK_RUNTIME_GENERATION")
+                .unwrap_or_else(|_| "1".into())
+                .parse()
+                .context("parse VDESK_RUNTIME_GENERATION")?
+        };
+        let data_token = if args.local {
+            Secret::generate()?
+        } else {
+            Secret::parse(required_env("VDESK_DATA_TOKEN")?)?
+        };
+        let viewer_token = if args.local {
+            Secret::generate()?
+        } else {
+            Secret::parse(required_env("VDESK_VIEWER_TOKEN")?)?
+        };
         let display = env::var("VDESK_DISPLAY").unwrap_or_else(|_| ":99".into());
         let (width, height) =
             parse_size(&env::var("VDESK_SIZE").unwrap_or_else(|_| "1280x800".into()))?;
@@ -57,32 +97,45 @@ impl RuntimeConfig {
             .unwrap_or_else(|_| "1".into())
             .parse()
             .context("parse VDESK_SCALE")?;
-        let novnc_dir = PathBuf::from(
-            env::var("VDESK_NOVNC_DIR").unwrap_or_else(|_| "/usr/share/novnc".into()),
+        let rfb_addr = if args.local {
+            "127.0.0.1:5900".parse().expect("fixed RFB address is valid")
+        } else {
+            env::var("VDESK_RFB_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:5900".into())
+                .parse()
+                .context("parse VDESK_RFB_ADDR")?
+        };
+        let local_root = local_store.as_ref().map(|store| store.root());
+        let human_input_socket = local_root.map_or_else(
+            || {
+                PathBuf::from(
+                    env::var("VDESK_HUMAN_INPUT_SOCKET")
+                        .unwrap_or_else(|_| "/run/vdesk/human-input.sock".into()),
+                )
+            },
+            |root| root.join("human-input.sock"),
         );
-        let rfb_addr = env::var("VDESK_RFB_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:5900".into())
-            .parse()
-            .context("parse VDESK_RFB_ADDR")?;
-        let human_input_socket = PathBuf::from(
-            env::var("VDESK_HUMAN_INPUT_SOCKET")
-                .unwrap_or_else(|_| "/run/vdesk/human-input.sock".into()),
+        let dbus_address = local_root.map_or_else(
+            || {
+                env::var("DBUS_SESSION_BUS_ADDRESS")
+                    .unwrap_or_else(|_| "unix:path=/run/vdesk/bus".into())
+            },
+            |root| format!("unix:path={}", root.join("bus").display()),
         );
-        let dbus_address = env::var("DBUS_SESSION_BUS_ADDRESS")
-            .unwrap_or_else(|_| "unix:path=/run/vdesk/bus".into());
         let dbus_socket = dbus_address
             .strip_prefix("unix:path=")
             .map(PathBuf::from)
             .context("DBUS_SESSION_BUS_ADDRESS must be a unix:path address")?;
-        if !is_bounded_runtime_path(&dbus_socket) {
-            bail!("D-Bus socket must stay under /run/vdesk or /tmp/vdesk");
-        }
-        if !novnc_dir.join("vnc.html").is_file() {
-            bail!("noVNC assets are missing at {}", novnc_dir.display());
+        let dbus_is_bounded =
+            local_store.as_ref().is_some_and(|store| dbus_socket.starts_with(store.root()))
+                || is_bounded_runtime_path(&dbus_socket);
+        if !dbus_is_bounded {
+            bail!("D-Bus socket must stay inside the private vdesk runtime directory");
         }
         Ok(Self {
             bind,
             session_id,
+            session_name: session_name.to_owned(),
             runtime_generation,
             data_token,
             viewer_token,
@@ -91,11 +144,25 @@ impl RuntimeConfig {
             height,
             dpi,
             scale,
-            novnc_dir,
             rfb_addr,
             human_input_socket,
             dbus_address,
             dbus_socket,
+            workspace_root: if args.local {
+                args.workspace_root
+                    .map(|path| validate_scope_root(path, "workspace"))
+                    .transpose()?
+            } else {
+                Some(PathBuf::from("/workspace"))
+            },
+            downloads_root: if args.local {
+                args.downloads_root
+                    .map(|path| validate_scope_root(path, "downloads"))
+                    .transpose()?
+            } else {
+                Some(PathBuf::from("/downloads"))
+            },
+            local_store,
         })
     }
 }
@@ -127,15 +194,51 @@ impl ManagedChild {
     }
 }
 
-pub async fn run(args: ServeArgs) -> Result<()> {
-    let config = RuntimeConfig::from_environment(args)?;
+pub async fn run(args: ServeArgs, session_name: &str) -> Result<()> {
+    let config = RuntimeConfig::from_environment(args, session_name)?;
 
     let mut children = Vec::new();
     let result = run_inner(&config, &mut children).await;
     for child in children.iter_mut().rev() {
         child.terminate().await;
     }
+    if let Some(store) = &config.local_store {
+        store.remove(config.session_id)?;
+    }
     result
+}
+
+pub async fn rfb_stdio() -> Result<()> {
+    let store = LocalRuntimeStore::discover()?;
+    let descriptor = store
+        .load()?
+        .context("no local vdesk runtime is available; start `vdesk serve --local`")?;
+    let client = DesktopClient::from_client_descriptor(&descriptor)?;
+    let health = client.health().await.context("local vdesk runtime is not healthy")?;
+    if !health.ready
+        || health.session_id != descriptor.session_id.to_string()
+        || health.runtime_generation != descriptor.runtime_generation
+    {
+        bail!("local vdesk descriptor does not match the running service");
+    }
+
+    let stream = tokio::net::TcpStream::connect("127.0.0.1:5900")
+        .await
+        .context("connect to the local vdesk RFB service")?;
+    let (mut rfb_read, mut rfb_write) = stream.into_split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    tokio::select! {
+        result = copy(&mut stdin, &mut rfb_write) => {
+            result.context("forward viewer input")?;
+            rfb_write.shutdown().await.context("close viewer input")?;
+        }
+        result = copy(&mut rfb_read, &mut stdout) => {
+            result.context("forward viewer output")?;
+            stdout.flush().await.context("flush viewer output")?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_inner(config: &RuntimeConfig, children: &mut Vec<ManagedChild>) -> Result<()> {
@@ -209,24 +312,52 @@ async fn run_inner(config: &RuntimeConfig, children: &mut Vec<ManagedChild>) -> 
     children.push(x11vnc);
     wait_for_tcp(config.rfb_addr).await?;
 
-    let driver = Arc::new(X11Driver::connect(&config.display, config.dpi, config.scale)?);
+    let driver = Arc::new(
+        X11Driver::connect(&config.display, config.dpi, config.scale)?
+            .with_session_bus(&config.dbus_address),
+    );
     if driver.geometry().width != config.width || driver.geometry().height != config.height {
         bail!("X display geometry does not match the requested session geometry");
     }
+    let listener = tokio::net::TcpListener::bind(config.bind)
+        .await
+        .with_context(|| format!("bind desktop service at {}", config.bind))?;
+    let service_addr = listener.local_addr().context("read desktop service address")?;
+    if let Some(store) = &config.local_store {
+        store.save(&ClientDescriptor {
+            descriptor_version: DESCRIPTOR_VERSION,
+            session_id: config.session_id,
+            name: config.session_name.clone(),
+            endpoint: format!("http://{service_addr}"),
+            data_token: config.data_token.clone(),
+            geometry: Geometry {
+                width: config.width,
+                height: config.height,
+                dpi: config.dpi,
+                scale: config.scale,
+            },
+            runtime_generation: config.runtime_generation,
+        })?;
+    }
     let service_config = ServiceConfig {
-        bind: config.bind,
-        session_id: config.session_id.clone(),
+        session_id: config.session_id.to_string(),
         runtime_generation: config.runtime_generation,
         data_token: config.data_token.clone(),
         viewer_token: config.viewer_token.clone(),
-        novnc_dir: config.novnc_dir.clone(),
         rfb_addr: config.rfb_addr,
         human_input_socket: Some(config.human_input_socket.clone()),
+        workspace_root: config.workspace_root.clone(),
+        downloads_root: config.downloads_root.clone(),
+        process_environment: vec![
+            ("DISPLAY".into(), config.display.clone()),
+            ("DBUS_SESSION_BUS_ADDRESS".into(), config.dbus_address.clone()),
+        ],
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let mut server = tokio::spawn(service::serve(service_config, driver, async move {
-        let _ = shutdown_rx.await;
-    }));
+    let mut server =
+        tokio::spawn(service::serve_on(listener, service_config, driver, async move {
+            let _ = shutdown_rx.await;
+        }));
     let mut monitor = tokio::time::interval(Duration::from_millis(500));
     monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -372,6 +503,15 @@ fn required_env(name: &str) -> Result<String> {
     env::var(name).with_context(|| format!("{name} is required"))
 }
 
+fn validate_scope_root(path: PathBuf, name: &str) -> Result<PathBuf> {
+    let path = std::fs::canonicalize(&path)
+        .with_context(|| format!("resolve {name} root {}", path.display()))?;
+    if !path.is_dir() {
+        bail!("{name} root is not a directory: {}", path.display());
+    }
+    Ok(path)
+}
+
 fn parse_size(value: &str) -> Result<(u32, u32)> {
     let Some((width, height)) = value.split_once('x') else {
         bail!("VDESK_SIZE must be WIDTHxHEIGHT");
@@ -391,6 +531,8 @@ fn is_bounded_runtime_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -404,5 +546,15 @@ mod tests {
     fn human_input_socket_scope_is_narrow() {
         assert!(is_bounded_runtime_path(Path::new("/run/vdesk/input.sock")));
         assert!(!is_bounded_runtime_path(Path::new("/tmp/unrelated.sock")));
+    }
+
+    #[test]
+    fn scope_roots_must_resolve_to_directories() {
+        let temporary = tempdir().unwrap();
+        assert_eq!(
+            validate_scope_root(temporary.path().to_owned(), "workspace").unwrap(),
+            temporary.path()
+        );
+        assert!(validate_scope_root(temporary.path().join("missing"), "workspace").is_err());
     }
 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 use vdesk_protocol::Geometry;
 
-const DESCRIPTOR_VERSION: u16 = 1;
+pub const DESCRIPTOR_VERSION: u16 = 1;
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -209,6 +209,82 @@ impl SessionDescriptor {
 #[derive(Debug, Clone)]
 pub struct StateStore {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalRuntimeStore {
+    root: PathBuf,
+}
+
+impl LocalRuntimeStore {
+    pub fn discover() -> Result<Self> {
+        if let Some(explicit) = std::env::var_os("VDESK_RUNTIME_DIR") {
+            return Self::new(PathBuf::from(explicit));
+        }
+        if let Some(xdg_runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            return Self::new(PathBuf::from(xdg_runtime).join("vdesk"));
+        }
+        if let Some(xdg_state) = std::env::var_os("XDG_STATE_HOME") {
+            return Self::new(PathBuf::from(xdg_state).join("vdesk/runtime"));
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            bail!("cannot locate runtime directory: set VDESK_RUNTIME_DIR or HOME");
+        };
+        Self::new(PathBuf::from(home).join(".local/state/vdesk/runtime"))
+    }
+
+    pub fn new(root: PathBuf) -> Result<Self> {
+        if root.as_os_str().is_empty() {
+            bail!("runtime directory must not be empty");
+        }
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn client_path(&self) -> PathBuf {
+        self.root.join("client.json")
+    }
+
+    pub fn ensure(&self) -> Result<()> {
+        ensure_private_directory(&self.root)
+    }
+
+    pub fn save(&self, descriptor: &ClientDescriptor) -> Result<PathBuf> {
+        validate_session_name(&descriptor.name)?;
+        descriptor.geometry.validate().context("validate descriptor geometry")?;
+        self.ensure()?;
+        let target = self.client_path();
+        refuse_symlink(&target)?;
+        let bytes = serde_json::to_vec_pretty(descriptor).context("serialize local descriptor")?;
+        if bytes.len() as u64 > MAX_DESCRIPTOR_BYTES {
+            bail!("local descriptor exceeds size limit");
+        }
+        write_atomic_private(&target, &bytes)?;
+        Ok(target)
+    }
+
+    pub fn load(&self) -> Result<Option<ClientDescriptor>> {
+        let target = self.client_path();
+        if !target.exists() {
+            return Ok(None);
+        }
+        load_client_descriptor(&target).map(Some)
+    }
+
+    pub fn remove(&self, session_id: Uuid) -> Result<()> {
+        let target = self.client_path();
+        let Some(descriptor) = self.load()? else {
+            return Ok(());
+        };
+        if descriptor.session_id != session_id {
+            return Ok(());
+        }
+        refuse_symlink(&target)?;
+        fs::remove_file(&target).with_context(|| format!("remove {}", target.display()))
+    }
 }
 
 impl StateStore {
@@ -425,6 +501,30 @@ fn write_and_sync(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+fn write_atomic_private(target: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = target.parent().context("descriptor has no parent directory")?;
+    let temporary = parent.join(format!(".client.{}.tmp", Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file =
+        options.open(&temporary).with_context(|| format!("create {}", temporary.display()))?;
+    if let Err(error) = write_and_sync(&mut file, bytes) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("write local descriptor");
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, target) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("publish {}", target.display()));
+    }
+    Ok(())
+}
+
 fn refuse_symlink(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -474,6 +574,10 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    fn local_descriptor() -> ClientDescriptor {
+        descriptor().client_descriptor(false)
     }
 
     #[test]
@@ -535,6 +639,44 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o644);
         }
+    }
+
+    #[test]
+    fn local_runtime_descriptor_is_private_and_generation_safe() {
+        let temporary = tempdir().unwrap();
+        let store = LocalRuntimeStore::new(temporary.path().join("runtime")).unwrap();
+        let descriptor = local_descriptor();
+        let path = store.save(&descriptor).unwrap();
+
+        assert_eq!(store.load().unwrap().unwrap().session_id, descriptor.session_id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(store.root()).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        store.remove(Uuid::new_v4()).unwrap();
+        assert!(store.load().unwrap().is_some());
+        store.remove(descriptor.session_id).unwrap();
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_runtime_descriptor_symlinks_are_refused() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().unwrap();
+        let store = LocalRuntimeStore::new(temporary.path().join("runtime")).unwrap();
+        store.ensure().unwrap();
+        let victim = temporary.path().join("victim");
+        fs::write(&victim, "do not touch").unwrap();
+        symlink(&victim, store.client_path()).unwrap();
+
+        assert!(store.save(&local_descriptor()).is_err());
+        assert!(store.load().is_err());
+        assert_eq!(fs::read_to_string(victim).unwrap(), "do not touch");
     }
 
     #[test]

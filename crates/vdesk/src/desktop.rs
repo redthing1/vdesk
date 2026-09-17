@@ -62,6 +62,7 @@ struct ScriptAccessibility {
 pub struct X11Driver {
     display: String,
     geometry: Geometry,
+    session_bus: Option<String>,
 }
 
 impl X11Driver {
@@ -77,7 +78,12 @@ impl X11Driver {
             scale,
         };
         geometry.validate().context("validate X display geometry")?;
-        Ok(Self { display, geometry })
+        Ok(Self { display, geometry, session_bus: None })
+    }
+
+    pub fn with_session_bus(mut self, address: impl Into<String>) -> Self {
+        self.session_bus = Some(address.into());
+        self
     }
 
     fn pointer(&self) -> Result<Point> {
@@ -539,20 +545,34 @@ impl DesktopDriver for X11Driver {
 
     fn launch(&self, argv: &[String]) -> Result<u32> {
         let (program, args) = argv.split_first().context("application argv is empty")?;
-        let child = Command::new(program)
-            .args(args)
-            .env("DISPLAY", &self.display)
+        let mut command = Command::new(program);
+        command.args(args).env("DISPLAY", &self.display);
+        if let Some(address) = &self.session_bus {
+            command.env("DBUS_SESSION_BUS_ADDRESS", address);
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("launch {program}"))?;
-        Ok(child.id())
+        let pid = child.id();
+        std::thread::Builder::new()
+            .name(format!("vdesk-reap-{pid}"))
+            .spawn(move || {
+                let _ = child.wait();
+            })
+            .context("start application reaper")?;
+        Ok(pid)
     }
 
     fn accessibility_snapshot(&self) -> Result<AccessibilitySnapshot> {
-        let output = Command::new("/usr/local/libexec/vdesk-a11y-snapshot")
-            .env("DISPLAY", &self.display)
+        let mut command = Command::new("/usr/local/libexec/vdesk-a11y-snapshot");
+        command.env("DISPLAY", &self.display);
+        if let Some(address) = &self.session_bus {
+            command.env("DBUS_SESSION_BUS_ADDRESS", address);
+        }
+        let output = command
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
