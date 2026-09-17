@@ -19,7 +19,8 @@ use tokio::process::Command;
 use crate::state::Secret;
 
 const VIEWER_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; \
-                          connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'none'";
+                          img-src 'self' data:; connect-src 'self' ws: wss:; \
+                          frame-ancestors 'none'; base-uri 'none'";
 
 #[derive(Debug, Clone)]
 pub struct ViewerConfig {
@@ -187,7 +188,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["content-security-policy"], VIEWER_CSP);
+        let csp = response.headers()["content-security-policy"].to_str().unwrap();
+        assert_eq!(csp, VIEWER_CSP);
+        assert!(csp.contains("img-src 'self' data:"));
         let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
         assert!(body.windows(b"viewer.js".len()).any(|window| window == b"viewer.js"));
     }
