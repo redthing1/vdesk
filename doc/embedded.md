@@ -12,31 +12,38 @@ host viewer -- existing exec/SSH --> sandbox --> private RFB
 There is no nested engine, second desktop container, published port, host
 display, shared descriptor mount, or provider-specific code.
 
-## Image integration
+## Install
 
-Build the distribution-neutral artifact image:
+Vdesk installs as one static binary plus the sandbox's native desktop packages.
+For Fedora:
+
+```sh
+dnf install -y --setopt=install_weak_deps=False \
+  at-spi2-core dbus-daemon dbus-x11 dejavu-sans-fonts liberation-fonts \
+  mesa-dri-drivers python3-pyatspi tigervnc-x11-server x11vnc xclip xdotool \
+  xfce4-panel xfce4-session xfce4-settings xfce4-terminal \
+  xfconf xfdesktop xfwm4
+install -m 0755 vdesk /usr/local/bin/vdesk
+```
+
+These commands work while building an image or inside an existing mutable
+mimchine. They do not change its user, home, workdir, entrypoint, or lifecycle.
+
+To build the static binary from this repository without installing Rust:
 
 ```sh
 podman build -f container/Containerfile --target artifacts \
-  -t localhost/vdesk:artifacts .
+  --output type=local,dest=dist .
 ```
 
-Copy it into the existing image without changing that image's lifecycle:
+The result is `dist/usr/local/bin/vdesk`. To bake it into an image:
 
 ```Dockerfile
-FROM localhost/vdesk:artifacts AS vdesk
 FROM your-existing-image
 
-# Install this distribution's Xvnc (or Xvfb), Xfce, x11vnc, xdotool, xclip,
-# D-Bus, AT-SPI/Python bindings, and basic fonts here.
-COPY --from=vdesk / /
+# Install the distribution's desktop packages here.
+COPY dist/ /
 ```
-
-Only package names are distribution-specific. The runtime requires `Xvnc` or
-`Xvfb` plus `xfce4-session`, `x11vnc`, `xdotool`, `xclip`, and `dbus-daemon`;
-the managed Containerfile is one tested example. Xvnc 1.14 or newer is required
-for DRI3 acceleration. The artifacts and runtime command are otherwise
-distribution-neutral.
 
 ## Start and use
 

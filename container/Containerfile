@@ -12,11 +12,8 @@ RUN apt-get update \
     && rustup target add "$(cat /tmp/rust-target)"
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY crates ./crates
-COPY container/a11y_snapshot.py /source/container/a11y_snapshot.py
 RUN cargo build --locked --release --target "$(cat /tmp/rust-target)" --bin vdesk \
-    && install -D "target/$(cat /tmp/rust-target)/release/vdesk" /out/usr/local/bin/vdesk \
-    && install -D -m 0755 container/a11y_snapshot.py \
-        /out/usr/local/libexec/vdesk-a11y-snapshot
+    && install -D "target/$(cat /tmp/rust-target)/release/vdesk" /out/usr/local/bin/vdesk
 
 FROM scratch AS artifacts
 
@@ -50,7 +47,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 --shell /bin/bash vdesk \
     && install -d -o vdesk -g vdesk -m 0700 /run/vdesk /run/vdesk/user \
-    && install -d -m 1777 /tmp/.X11-unix \
     && install -d -o vdesk -g vdesk -m 0755 /workspace /downloads \
     && ln -s /usr/local/bin/vdesk /usr/local/bin/vdesk-chromium \
     && ln -s /usr/local/bin/vdesk-chromium /usr/local/bin/chromium

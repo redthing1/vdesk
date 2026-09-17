@@ -40,10 +40,9 @@ from X11 as lossless PNGs; agent coordinates never depend on the resized or
 compressed browser view. Input is injected through XTest.
 
 The managed `minimal` image contains the runtime. `default` adds Chromium,
-Mousepad, and Thunar. The distribution-neutral `artifacts` stage contains only
-the static binary and AT-SPI helper for copying into existing images. Package
-selection stays at that image's packaging boundary. Additional applications
-belong in derived images.
+Mousepad, and Thunar. The distribution-neutral `artifacts` stage contains one
+static binary for copying into existing images. Package selection stays at that
+image's packaging boundary. Additional applications belong in derived images.
 
 `vdesk serve --local` generates local credentials, binds the API to a random
 loopback port, and atomically publishes a data-only descriptor in a private

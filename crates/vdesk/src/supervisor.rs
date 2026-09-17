@@ -249,6 +249,7 @@ pub async fn rfb_stdio() -> Result<()> {
 }
 
 async fn run_inner(config: &RuntimeConfig, children: &mut Vec<ManagedChild>) -> Result<()> {
+    ensure_x11_socket_directory()?;
     remove_stale_socket(&config.dbus_socket, "D-Bus")?;
     let dbus = spawn(
         "dbus-daemon",
@@ -543,6 +544,32 @@ fn remove_stale_socket(path: &Path, name: &str) -> Result<()> {
         Ok(_) => bail!("refusing non-socket {name} path at {}", path.display()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+fn ensure_x11_socket_directory() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let path = Path::new("/tmp/.X11-unix");
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => bail!("refusing non-directory X11 socket path at {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect X11 socket directory"),
+    }
+    match std::fs::create_dir(path) {
+        Ok(()) => std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o1777))
+            .context("set X11 socket directory permissions"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata =
+                std::fs::symlink_metadata(path).context("inspect X11 socket directory")?;
+            if metadata.is_dir() {
+                Ok(())
+            } else {
+                bail!("refusing non-directory X11 socket path at {}", path.display())
+            }
+        }
+        Err(error) => Err(error).context("create X11 socket directory"),
     }
 }
 

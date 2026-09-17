@@ -95,7 +95,7 @@ Agent instructions are in [skills/vdesk/SKILL.md](skills/vdesk/SKILL.md).
 
 ## Existing containers and VMs
 
-Install the runtime artifacts and graphical packages in the existing image,
+Install the single vdesk binary and the distribution's graphical packages,
 then run one foreground process:
 
 ```sh
@@ -123,8 +123,8 @@ runtime's fixed private RFB endpoint; it is not a general proxy. There is no
 second container, published port, engine socket, shared display, or
 vdesk-specific provider integration.
 
-See [doc/embedded.md](doc/embedded.md) for image integration, the optional
-mimchine startup hook, scoped files/processes, and the trust boundary.
+See [doc/embedded.md](doc/embedded.md) for the Fedora install command, image
+integration, scoped files/processes, and the optional mimchine startup hook.
 
 ## Images
 
@@ -136,9 +136,9 @@ vdesk image build --profile default --tag localhost/vdesk:dev
 The minimal image contains Xvnc, Xfce, x11vnc, AT-SPI, and the vdesk
 service. The default image adds Chromium, Mousepad, and Thunar.
 
-The `artifacts` target contains only the static binary and AT-SPI helper. Copy it
-into any image and install that distribution's graphical packages; vdesk does
-not replace the image's user, HOME, workdir, entrypoint, or lifecycle.
+The `artifacts` target contains one static binary. Copy it into any image and
+install that distribution's graphical packages; vdesk does not replace the
+image's user, HOME, workdir, entrypoint, or lifecycle.
 
 The desktop runs as a non-root user with dropped capabilities,
 `no-new-privileges`, resource limits, one scoped workspace mount, and no engine

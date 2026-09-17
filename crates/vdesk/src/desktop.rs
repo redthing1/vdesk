@@ -18,6 +18,8 @@ use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt as _, ImageFormat, ImageOrder, Visualtype, Window,
 };
 
+const A11Y_SNAPSHOT: &str = include_str!("../assets/a11y_snapshot.py");
+
 pub struct DriverCapture {
     pub png: Vec<u8>,
     pub width: u32,
@@ -581,7 +583,8 @@ impl DesktopDriver for X11Driver {
     }
 
     fn accessibility_snapshot(&self) -> Result<AccessibilitySnapshot> {
-        let mut command = Command::new("/usr/local/libexec/vdesk-a11y-snapshot");
+        let mut command = Command::new("python3");
+        command.args(["-c", A11Y_SNAPSHOT]);
         command.env("DISPLAY", &self.display);
         if let Some(address) = &self.session_bus {
             command.env("DBUS_SESSION_BUS_ADDRESS", address);
