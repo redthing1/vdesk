@@ -34,10 +34,12 @@ compatibility boundary.
 
 `vdesk serve` starts an X11 server at fixed geometry, D-Bus, Xfce, the desktop
 service, and a loopback-only x11vnc process. It prefers Xvnc and falls back to
-Xvfb when Xvnc is absent. It stays in the foreground, owns and reaps its
-children, and shuts them down on TERM or INT. Screenshots are captured directly
-from X11 as lossless PNGs; agent coordinates never depend on the resized or
-compressed browser view. Input is injected through XTest.
+Xvfb when Xvnc is absent. Display blanking, DPMS, and the X server's built-in
+screensaver are disabled so an idle desktop remains observable. The supervisor
+stays in the foreground, owns and reaps its children, and shuts them down on
+TERM or INT. Screenshots are captured directly from X11 as lossless PNGs; agent
+coordinates never depend on the resized or compressed browser view. Input is
+injected through XTest.
 
 The managed `minimal` image contains the runtime. `default` adds Chromium,
 Mousepad, and Thunar. The distribution-neutral `artifacts` stage contains one
